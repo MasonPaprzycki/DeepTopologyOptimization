@@ -55,7 +55,7 @@ def main():
             )._compute(xyz)
         return sdf_fn
 
-    num_scenes = 25
+    num_scenes = 5
     x_positions = np.linspace(-0.8, 0.8, num_scenes)
 
     scenes = {
@@ -73,7 +73,7 @@ def main():
         model_name="SlidingSphereModel2D",
         scenes=scenes,
         latent_dim=1,
-        num_epochs=1,
+        num_epochs=200,
     )
 
     print("[INFO] Training model...")
@@ -132,7 +132,7 @@ def main():
     # ======================================================
     # Latent-space sweep
     # ======================================================
-    interp_steps = 100
+    interp_steps = 50
     latent_values = torch.linspace(0.0, 1.0, interp_steps).to(device)
 
     print("[INFO] Generating latent-sweep frames...")

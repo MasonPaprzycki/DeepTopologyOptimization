@@ -58,7 +58,7 @@ model = Model.Model(
     model_name="TrainOnASphereModel",
     scenes=scenes,
     latent_dim=1,
-    num_epochs=260,
+    num_epochs=100,
     domain_radius=0.45,
     device="cpu",  # Force CPU to avoid CUDA errors
 )

@@ -7,115 +7,65 @@ from typing import Dict, Tuple
 import os
 import matplotlib.pyplot as plt
 
-#utilities 
-
+# -----------------------------
+# Utilities
+# -----------------------------
 def clamp_sdf(x, delta=0.1):
+    """Clamp SDF to [-delta, delta] to focus on near-surface points."""
     return torch.clamp(x, -delta, delta)
 
 
 def clamped_l1_loss(pred, target, delta=0.1):
-    return torch.abs(
-        clamp_sdf(pred, delta) - clamp_sdf(target, delta)
-    )
+    """Clamped L1 loss, summing differences after clamping."""
+    return torch.abs(clamp_sdf(pred, delta) - clamp_sdf(target, delta))
 
 
 # -----------------------------
 # DeepSDF Network
 # -----------------------------
-
 class DeepSDF(nn.Module):
-    """
-    DeepSDF auto-decoder MLP.
-
-    f_theta(x, z) -> sdf
-
-    - Geometry (xyz + operator params) processed first
-    - Scene latent injected at input and again mid-network
-    - Latent acts as a basis coefficient, not a bias
-    """
-
-    def __init__(
-        self,
-        input_dim: int,          # xyz + operator params
-        latent_dim: int = 256,
-        hidden_dim: int = 512,
-        num_layers: int = 8,
-        latent_injection_layer: int = 4,
-        dropout: float = 0.0,
-    ):
+    """DeepSDF MLP with latent injection at input and mid-network."""
+    def __init__(self, input_dim, latent_dim=256, hidden_dim=512,
+                 num_layers=8, latent_injection_layer=4):
         super().__init__()
-
-        assert latent_injection_layer < num_layers
-
-        self.input_dim = input_dim
-        self.latent_dim = latent_dim
-        self.num_layers = num_layers
         self.latent_injection_layer = latent_injection_layer
 
         layers = nn.ModuleList()
-
-        # Layer 0: geometry + latent
-        layers.append(
-            nn.Linear(input_dim + latent_dim, hidden_dim)
-        )
-
-        # Hidden layers
+        layers.append(nn.Linear(input_dim + latent_dim, hidden_dim))
         for i in range(1, num_layers):
             if i == latent_injection_layer:
-                layers.append(
-                    nn.Linear(hidden_dim + latent_dim, hidden_dim)
-                )
+                layers.append(nn.Linear(hidden_dim + latent_dim, hidden_dim))
             else:
-                layers.append(
-                    nn.Linear(hidden_dim, hidden_dim)
-                )
+                layers.append(nn.Linear(hidden_dim, hidden_dim))
 
         self.layers = layers
         self.final = nn.Linear(hidden_dim, 1)
-
         self.activation = nn.ReLU(inplace=True)
-        self.dropout = nn.Dropout(dropout)
-
         self._init_weights()
 
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                nn.init.normal_(
-                    m.weight,
-                    mean=0.0,
-                    std=math.sqrt(2) / math.sqrt(m.out_features),
-                )
+                nn.init.normal_(m.weight, mean=0.0, std=0.02)
                 nn.init.constant_(m.bias, 0.0)
 
-    def forward(self, x: torch.Tensor, z: torch.Tensor):
-        """
-        x: (B, input_dim)
-        z: (B, latent_dim)
-        """
-
-        # First latent injection
+    def forward(self, x, z):
         h = torch.cat([x, z], dim=1)
-
         for i, layer in enumerate(self.layers):
             if i == self.latent_injection_layer:
-                # Second latent injection
                 h = torch.cat([h, z], dim=1)
-
-            h = layer(h)
-            h = self.activation(h)
-            h = self.dropout(h)
-
+            h = self.activation(layer(h))
         return self.final(h)
 
-class SDFDataset(Dataset):
-    """
-    data[shape_id] = (points[N, D], sdf[N, 1])
-    """
 
-    def __init__(self, data: Dict[int, Tuple[torch.Tensor, torch.Tensor]]):
-        self.data = data
+# -----------------------------
+# Dataset
+# -----------------------------
+class SDFDataset(Dataset):
+    """Dataset for shapes: each item is (shape_id, points[N,D], sdf[N,1])"""
+    def __init__(self, data):
         self.shape_ids = list(data.keys())
+        self.data = data
 
     def __len__(self):
         return len(self.shape_ids)
@@ -126,70 +76,66 @@ class SDFDataset(Dataset):
         return sid, pts, sdf
 
 
+# -----------------------------
+# Trainer
+# -----------------------------
 class DeepSDFTrainer:
-    def __init__(
-        self,
-        base_directory: str,
-        model: DeepSDF,
-        num_shapes: int,
-        latent_dim: int = 256,
-        latent_sigma: float = 0.01,
-        lr_network: float = 1e-4,
-        lr_latent: float = 1e-3,
-        clamp_delta: float = 0.1,
-        device: str = "cpu"
-    ):
+    """Trainer for DeepSDF auto-decoder."""
+    def __init__(self, base_directory, model, num_shapes, latent_dim=256, sigma0=1e-4,
+                 lr_net=5e-4, lr_latent=1e-3, clamp_delta=0.1, device="cpu"):
+        
+        self.base_directory = base_directory
         self.device = device
         self.model = model.to(device)
-        self.latent_sigma = latent_sigma
+        self.sigma0 = sigma0
         self.clamp_delta = clamp_delta
-
-        # Latent codes
-        self.latents = nn.Embedding(num_shapes, latent_dim)
-        nn.init.normal_(self.latents.weight, mean=0.0, std=latent_sigma)
-        self.latents = self.latents.to(device)
-
-        self.optimizer = optim.Adam(
-            [
-                {"params": self.model.parameters(), "lr": lr_network},
-                {"params": self.latents.parameters(), "lr": lr_latent},
-            ]
-        )
-
-        # Create save directory
-        self.save_dir = os.path.join(base_directory, "checkpoints")
+        self.save_dir = os.path.join(base_directory, "snapshots")
         os.makedirs(self.save_dir, exist_ok=True)
 
-        # For logging
+        # Initialize latent codes
+        self.latents = nn.Embedding(num_shapes, latent_dim)
+        nn.init.normal_(self.latents.weight, mean=0.0, std=0.01)
+        self.latents = self.latents.to(device)
+
+        # Optimizer: separate learning rates for network and latents
+        self.optimizer = optim.Adam([
+            {"params": self.model.parameters(), "lr": lr_net},
+            {"params": self.latents.parameters(), "lr": lr_latent},
+        ])
+
+        # Loss history for plotting
         self.loss_history = {"total": [], "data": [], "latent_reg": []}
 
-    def train_step(self, shape_ids, points, sdf_gt):
+    def train_step(self, shape_ids, points, sdf, sigma):
+        """Single training step implementing Eq. (6)."""
         B, N, D = points.shape
-
         shape_ids = shape_ids.to(self.device)
-        points = points.to(self.device).view(-1, D)
-        sdf_gt = sdf_gt.to(self.device).view(-1, 1)
+        points = points.to(self.device)
+        sdf = sdf.to(self.device)
 
-        # Latent expansion per-point
-        z = self.latents(shape_ids)
-        z = z.unsqueeze(1).expand(B, N, -1).reshape(-1, z.shape[-1])
+        # --- Latent per shape ---
+        z_shape = self.latents(shape_ids)  # (B, latent_dim)
 
-        sdf_pred = self.model(points, z)
-        data_loss = clamped_l1_loss(sdf_pred, sdf_gt, self.clamp_delta).mean()
-        latent_reg = (z ** 2).sum(dim=1).mean() / (self.latent_sigma ** 2)
+        # --- Latent regularization ---
+        latent_reg = sigma * (z_shape ** 2).sum()
+
+        # --- Expand latent to per-point ---
+        z = z_shape[:, None, :].expand(B, N, -1).reshape(-1, z_shape.shape[1])
+        x = points.reshape(-1, D)
+        s = sdf.reshape(-1, 1)
+
+        # --- Data term ---
+        pred = self.model(x, z)
+        data_loss = clamped_l1_loss(pred, s, self.clamp_delta).sum()
+
+        # --- Total loss ---
         loss = data_loss + latent_reg
 
         self.optimizer.zero_grad()
         loss.backward()
-        nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-        nn.utils.clip_grad_norm_(self.latents.parameters(), 1.0)
         self.optimizer.step()
 
-        return {
-            "total": loss.item(),
-            "data": data_loss.item(),
-            "latent_reg": latent_reg.item(),
-        }
+        return loss.item(), data_loss.item(), latent_reg.item()
 
     def save_snapshot(self, epoch: int):
         """Save model, latents, and optimizer states for a given epoch."""
@@ -203,8 +149,32 @@ class DeepSDFTrainer:
         torch.save(snapshot, path)
         print(f"[INFO] Saved snapshot → {path}")
 
+    def train(self, dataloader, epochs, snapshot_every=100):
+        """Full training loop with logging and loss tracking."""
+        for epoch in range(1, epochs + 1):
+            sigma = self.sigma0 * min(1.0, 1.0 / epoch)
+            epoch_total, epoch_data, epoch_latent = 0.0, 0.0, 0.0
+
+            for sid, pts, sdf in dataloader:
+                loss, data_loss, latent_reg = self.train_step(sid, pts, sdf, sigma)
+                epoch_total += loss
+                epoch_data += data_loss
+                epoch_latent += latent_reg
+
+            # Store averaged losses for plotting
+            self.loss_history["total"].append(epoch_total / len(dataloader))
+            self.loss_history["data"].append(epoch_data / len(dataloader))
+            self.loss_history["latent_reg"].append(epoch_latent / len(dataloader))
+
+            if epoch % snapshot_every == 0:
+                self.save_snapshot(epoch)
+                print(f"[{epoch:04d}] total_loss={epoch_total:.6e} "
+                    f"data_loss={epoch_data:.6e} latent_reg={epoch_latent:.6e}")
+                
+        self.plot_losses()
+
     def plot_losses(self):
-        """Plot loss curves over training epochs."""
+        """Plot the training curves of total, data, and latent losses."""
         plt.figure(figsize=(8, 5))
         plt.plot(self.loss_history["total"], label="Total Loss")
         plt.plot(self.loss_history["data"], label="Data Loss")
@@ -221,53 +191,15 @@ class DeepSDFTrainer:
         plt.close()
         print(f"[INFO] Loss curve saved → {save_path}")
 
-    def train(
-        self,
-        dataloader: torch.utils.data.DataLoader,
-        num_epochs: int = 500,
-        snapshot_every: int = 1,
-    ):
-        """Full training loop with snapshot saving and logging."""
-        for epoch in range(num_epochs):
-            epoch_loss = 0.0
-            for shape_ids, points, sdf in dataloader:
-                stats = self.train_step(shape_ids, points, sdf)
-                epoch_loss += stats["total"]
 
-            epoch_loss /= len(dataloader)
-            self.loss_history["total"].append(epoch_loss)
-            self.loss_history["data"].append(stats["data"])
-            self.loss_history["latent_reg"].append(stats["latent_reg"])
-
-            if epoch % snapshot_every == 0:
-                print(
-                    f"[EPOCH {epoch:04d}] "
-                    f"loss={epoch_loss:.6f} "
-                    f"data={stats['data']:.6f} "
-                    f"latent regression={stats['latent_reg']:.6f}"
-                )
-                self.save_snapshot(epoch )
-            
-        # Save final loss curve
-        self.plot_losses()
-
-
-def infer_latent(
-    model: DeepSDF,
-    points: torch.Tensor,
-    sdf: torch.Tensor,
-    latent_dim: int = 256,
-    latent_sigma: float = 0.01,
-    lr: float = 1e-3,
-    iters: int = 800,
-    clamp_delta: float = 0.1,
-    device: str = "cpu",
-):
-    """
-    Solves:
-        argmin_z sum L(f(z,x), s) + ||z||^2 / sigma^2
-    """
-
+# -----------------------------
+# Latent inference
+# -----------------------------
+def infer_latent(model: DeepSDF, points: torch.Tensor, sdf: torch.Tensor,
+                 latent_dim: int = 256, latent_sigma: float = 0.01,
+                 lr: float = 1e-3, iters: int = 800, clamp_delta: float = 0.1,
+                 device: str = "cpu"):
+    """Optimize a latent vector for a new shape with a fixed network."""
     model.eval()
     points = points.to(device)
     sdf = sdf.to(device)
@@ -281,12 +213,8 @@ def infer_latent(
         z_rep = z.expand(points.shape[0], -1)
         pred = model(points, z_rep)
 
-        data_loss = clamped_l1_loss(
-            pred, sdf, clamp_delta
-        ).mean()
-
+        data_loss = clamped_l1_loss(pred, sdf, clamp_delta).mean()
         latent_reg = (z ** 2).sum() / (latent_sigma ** 2)
-
         loss = data_loss + latent_reg
 
         optimizer.zero_grad()
@@ -294,5 +222,3 @@ def infer_latent(
         optimizer.step()
 
     return z.detach()
-
-

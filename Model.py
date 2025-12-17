@@ -1,20 +1,48 @@
+from typing import Callable, Dict, Tuple, List, Optional
 import os
-import random
-import math
-from typing import Callable, Dict, List, Optional, Tuple
-
-import os
-import torch
-import numpy as np
-import trimesh
-from skimage import measure
-from DeepSDFTrainer import DeepSDF  
-from torch.utils.data import Dataset, DataLoader
 from DeepSDFTrainer import DeepSDF, DeepSDFTrainer
+import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader
+from skimage import measure
+import trimesh
+
 
 SDFCallable = Callable[[torch.Tensor, Optional[torch.Tensor]], torch.Tensor]
 SceneWithOperators = Dict[int, Tuple[SDFCallable, List[Tuple[float, float]]]]
 Scenes = Dict[str, SceneWithOperators]
+
+# ---------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------
+def sample_uniform_dirs(n: int, device: torch.device) -> torch.Tensor:
+    v = torch.randn(n, 3, device=device)
+    return v / (v.norm(dim=1, keepdim=True) + 1e-12)
+
+def estimate_center(
+    sdf_fn: Callable[[torch.Tensor], torch.Tensor],
+    probe_N: int,
+    surface_thresh: float,
+    init_range: float,
+    fallback_center: torch.Tensor,
+    device: torch.device,
+):
+    pts = (torch.rand(probe_N, 3, device=device) * 2 - 1) * init_range
+    sdf_vals = sdf_fn(pts).view(-1)
+
+    mask = torch.abs(sdf_vals) < surface_thresh
+    if mask.sum() < 128:
+        return fallback_center.clone()
+
+    near_pts = pts[mask]
+    near_sdf = sdf_vals[mask]
+
+    dirs = near_pts / (near_pts.norm(dim=1, keepdim=True) + 1e-12)
+    projected = near_pts - near_sdf.unsqueeze(1) * dirs
+
+    return projected.median(dim=0).values
+
+
 
 
 class SceneSDFDataset(Dataset):
@@ -91,35 +119,26 @@ class Model:
 
         device = torch.device("cpu")
 
-        # ---------------------------------------------------------
-        # Helpers
-        # ---------------------------------------------------------
-        def sample_uniform_dirs(n):
-            v = torch.randn(n, 3, device=device)
-            return v / (v.norm(dim=1, keepdim=True) + 1e-12)
-
-        def estimate_center(sdf_fn, probe_N=200_000):
-            probe_pts = (torch.rand(probe_N, 3, device=device) * 2 - 1) * self.domain_radius
-            sdf_vals = sdf_fn(probe_pts, None)
-            sdf_vals = sdf_vals[:, 0] if sdf_vals.dim() == 2 else sdf_vals
-
-            mask = torch.abs(sdf_vals) < max(0.3, clamp_dist * 3)
-            if mask.sum() < 128:
-                return torch.zeros(3, device=device)
-
-            near_pts = probe_pts[mask]
-            near_sdf = sdf_vals[mask]
-
-            projected = near_pts - near_sdf.unsqueeze(1) * (
-                near_pts / (near_pts.norm(dim=1, keepdim=True) + 1e-12)
-            )
-            return projected.median(dim=0).values
+        
 
         # ---------------------------------------------------------
         # Scene center estimation
         # ---------------------------------------------------------
         any_sdf_fn, _ = next(iter(scene.values()))
-        shape_center = estimate_center(any_sdf_fn)
+
+        def sdf_eval(xyz: torch.Tensor) -> torch.Tensor:
+            sdf = any_sdf_fn(xyz, None)
+            return sdf[:, 0] if sdf.dim() == 2 else sdf
+
+        shape_center = estimate_center(
+            sdf_fn=sdf_eval,
+            probe_N=200_000,
+            surface_thresh=0.3,
+            init_range=self.domain_radius,
+            fallback_center=torch.zeros(3, device=device),
+            device=device,
+        )
+
 
         ops = list(scene.values())
         n_ops = len(ops)
@@ -145,7 +164,7 @@ class Model:
             # -----------------------------------------------------
             # Estimate surface radius
             # -----------------------------------------------------
-            dirs = sample_uniform_dirs(2048)
+            dirs = sample_uniform_dirs(2048, device=device)
             probes = shape_center.unsqueeze(0) + dirs * (self.domain_radius * 0.95)
             sd = sdf_fn(probes, None)
             sd = sd[:, 0] if sd.dim() == 2 else sd
@@ -162,7 +181,7 @@ class Model:
             used_pos = used_neg = 0
 
             attempts = 0
-            max_attempts = 20_000
+            max_attempts = 50_000
             batch_size = 4096
 
             while (
@@ -254,7 +273,7 @@ class Model:
         print("[INFO] Sampling scenes")
 
         clamp_dist = 0.1
-        samples_per_scene = 50_000
+        samples_per_scene = 5000
 
         scene_samples: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
 
@@ -294,9 +313,6 @@ class Model:
             base_directory=self.base_directory,
             num_shapes=len(self.scenes),
             latent_dim=self.latent_dim,
-            latent_sigma=0.01,
-            lr_network=1e-4,
-            lr_latent=1e-3,
             clamp_delta=clamp_dist,
             device=self.device,
         )
@@ -305,8 +321,8 @@ class Model:
 
         trainer.train(
             dataloader=loader,
-            num_epochs=self.num_epochs,
-            snapshot_every=10  # saves every 10 epochs
+            epochs=self.num_epochs,
+            snapshot_every=200  # saves every 200 epochs
         )
 
         self.model = model
@@ -368,64 +384,62 @@ class Model:
         param_values=None,
         save_suffix=None,
     ):
-        """
-        Visualize a trained scene from this Model instance.
-        Uses self.trained_scenes and compute_trained_sdf internally.
-        Fully CPU-compatible.
-        """
         if param_values is None:
             param_values = [None]
 
         meshes = []
 
-        # Build sampling grid
-        xyz_points, x, y, z = self._build_grid(grid_center, grid_res)
+        latent_vector = latent.view(1, -1).float()
+        decoder = self.model
+        device = next(decoder.parameters()).device
+
+        example_scene = next(iter(self.scenes.values()))
+        _, param_ranges = next(iter(example_scene.values()))
+        num_params = len(param_ranges)
+
+        xyz_points, x, y, z = self.build_dynamic_sampling_grid(
+            latent_vector=latent_vector,
+            grid_res=grid_res,
+            grid_center=grid_center,
+            device=device,
+        )
 
         for idx, param_case in enumerate(param_values):
             pts = xyz_points.clone()
+
+            param_tensor = None
             if param_case is not None:
-                param_tensor = torch.as_tensor(param_case, dtype=torch.float32).view(1, -1)
-                pts = torch.cat([pts, param_tensor.repeat(pts.shape[0], 1)], dim=1)
+                param_tensor = torch.tensor(param_case).view(1, -1)
+                pts = torch.cat([pts, param_tensor.repeat(len(pts), 1)], dim=1)
 
-            # Compute SDF using Scene's trained latent
-    
             sdf = self.compute_sdf_from_latent(
-                    latent_vector=latent,
-                    xyz=pts,
-                    params=param_tensor if param_case is not None else None,
-                    chunk=50000,
-                ).cpu().numpy()
+                latent_vector=latent_vector,
+                xyz=pts,
+                params=param_tensor,
+            ).cpu().numpy()
 
-            # Clip SDF and check for zero-crossing
             volume = np.clip(sdf.reshape(grid_res, grid_res, grid_res), -clamp_dist, clamp_dist)
             if not (volume.min() < 0 < volume.max()):
-                print(f"[WARN] No zero-crossing found — skipping mesh for case {idx}")
                 continue
 
             verts, faces, normals, _ = measure.marching_cubes(volume, level=0.0)
             scale = x[1] - x[0]
             verts = verts * scale + np.array([x[0], y[0], z[0]])
-            mesh = trimesh.Trimesh(vertices=verts, faces=faces, vertex_normals=normals)
 
-            # Save mesh
+            mesh = trimesh.Trimesh(verts, faces, vertex_normals=normals)
+
             mesh_dir = os.path.join(self.base_directory, "Meshes")
             os.makedirs(mesh_dir, exist_ok=True)
 
-            suffix_parts = []
-            if param_case is not None:
-                safe_param = "_".join([f"{v:.2f}".replace("-", "m").replace("+", "p")
-                                    for v in np.atleast_1d(param_case)])
-                suffix_parts.append(f"params{safe_param}")
+            suffix = f"_case{idx:02d}"
             if save_suffix:
-                suffix_parts.append(save_suffix)
-            suffix_parts.append(f"case{idx:02d}")
-            suffix_str = "_" + "_".join(suffix_parts)
+                suffix += f"_{save_suffix}"
 
-            mesh_filename = f"{self.model_name.lower()}_{key}{suffix_str}_mesh.ply"
-            mesh_path = os.path.join(mesh_dir, mesh_filename)
+            mesh_path = os.path.join(
+                mesh_dir, f"{self.model_name.lower()}_{key}{suffix}_mesh.ply"
+            )
+
             mesh.export(mesh_path)
-            print(f"[INFO] Saved mesh → {mesh_path}")
-
             meshes.append(mesh)
 
         return meshes
@@ -442,6 +456,85 @@ class Model:
         grid = np.stack(np.meshgrid(x, y, z, indexing="ij"), axis=-1)
         pts_flat = torch.from_numpy(grid.reshape(-1, 3)).float()
         return pts_flat, x, y, z
+    
+    def build_dynamic_sampling_grid(
+        self,
+        latent_vector: torch.Tensor,
+        grid_res: int,
+        grid_center=(0.0, 0.0, 0.0),
+        init_range: float = 3.0,
+        probe_N: int = 200_000,
+        surface_thresh: float = 0.3,
+        n_surface_probes: int = 2048,
+        bbox_margin_ratio: float = 0.12,
+        fallback_center=(0.0, 0.0, 0.0),
+        device: Optional[torch.device] = None,
+    ):
+        """
+        Builds a sampling grid tightly enclosing the zero level set
+        of a learned DeepSDF shape.
+
+        This function:
+        - uses ONLY sdf_fn(xyz) → sdf
+        - takes the latent vector explicitly
+        - performs center + radius estimation once
+        """
+
+        if device is None:
+            device = latent_vector.device
+
+        latent_vector = latent_vector.to(device)
+
+        fallback_center = torch.tensor(
+            fallback_center, dtype=torch.float32, device=device
+        )
+
+        # ------------------------------------------------------------
+        # Center estimation
+        # ------------------------------------------------------------
+        pts = (torch.rand(probe_N, 3, device=device) * 2 - 1) * init_range
+        sdf_vals = self.compute_sdf_from_latent(latent_vector, pts).view(-1)
+
+        near_mask = torch.abs(sdf_vals) < surface_thresh
+        if near_mask.sum() < 128:
+            center = fallback_center.clone()
+        else:
+            near_pts = pts[near_mask]
+            near_sdf = sdf_vals[near_mask]
+
+            dirs = near_pts / (near_pts.norm(dim=1, keepdim=True) + 1e-12)
+            projected = near_pts - near_sdf.unsqueeze(1) * dirs
+            center = projected.median(dim=0).values
+
+        # ------------------------------------------------------------
+        # Radius estimation
+        # ------------------------------------------------------------
+        dirs = sample_uniform_dirs(n_surface_probes, device)
+        probes = center.unsqueeze(0) + dirs * (init_range * 0.95)
+
+        sd = self.compute_sdf_from_latent(latent_vector, probes)
+        radii = (probes - center).norm(dim=1) - sd
+
+        radius = torch.median(radii).clamp(min=1e-3).item()
+        margin = radius * bbox_margin_ratio
+
+        # ------------------------------------------------------------
+        # Grid construction
+        # ------------------------------------------------------------
+        lo = center.cpu().numpy() - (radius + margin)
+        hi = center.cpu().numpy() + (radius + margin)
+
+        hi = np.maximum(hi, lo + 1e-6)
+
+        x = np.linspace(lo[0], hi[0], grid_res)
+        y = np.linspace(lo[1], hi[1], grid_res)
+        z = np.linspace(lo[2], hi[2], grid_res)
+
+        grid = np.stack(np.meshgrid(x, y, z, indexing="ij"), axis=-1)
+        pts_flat = torch.from_numpy(grid.reshape(-1, 3)).float()
+
+        return pts_flat, x, y, z
+
 
 
 
