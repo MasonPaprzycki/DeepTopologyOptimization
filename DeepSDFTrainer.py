@@ -19,6 +19,10 @@ def clamped_l1_loss(pred, target, delta=0.1):
     """Clamped L1 loss, summing differences after clamping."""
     return torch.abs(clamp_sdf(pred, delta) - clamp_sdf(target, delta))
 
+def l1_loss(pred, target):
+    """Standard L1 loss."""
+    return torch.abs(pred - target)
+
 
 # -----------------------------
 # DeepSDF Network
@@ -26,9 +30,10 @@ def clamped_l1_loss(pred, target, delta=0.1):
 class DeepSDF(nn.Module):
     """DeepSDF MLP with latent injection at input and mid-network."""
     def __init__(self, input_dim, latent_dim=256, hidden_dim=512,
-                 num_layers=8, latent_injection_layer=4):
+                 num_layers=8, latent_injection_layer=4, soft_latent=True):
         super().__init__()
         self.latent_injection_layer = latent_injection_layer
+        self.soft_latent = soft_latent
 
         layers = nn.ModuleList()
         layers.append(nn.Linear(input_dim + latent_dim, hidden_dim))
@@ -40,7 +45,8 @@ class DeepSDF(nn.Module):
 
         self.layers = layers
         self.final = nn.Linear(hidden_dim, 1)
-        self.activation = nn.ReLU(inplace=True)
+        self.activation = nn.Softplus(beta=100) if soft_latent else nn.ReLU(inplace=True)
+
         self._init_weights()
 
     def _init_weights(self):
@@ -82,10 +88,11 @@ class SDFDataset(Dataset):
 class DeepSDFTrainer:
     """Trainer for DeepSDF auto-decoder."""
     def __init__(self, base_directory, model, num_shapes, latent_dim=256, sigma0=1e-4,
-                 lr_net=5e-4, lr_latent=1e-3, clamp_delta=0.1, device="cpu"):
+                 lr_net=5e-4, lr_latent=1e-3, clamp_delta=None, device="cpu",regularize_latent: bool = True):
         
         self.base_directory = base_directory
         self.device = device
+        self.regularize_latent = regularize_latent
         self.model = model.to(device)
         self.sigma0 = sigma0
         self.clamp_delta = clamp_delta
@@ -117,7 +124,7 @@ class DeepSDFTrainer:
         z_shape = self.latents(shape_ids)  # (B, latent_dim)
 
         # --- Latent regularization ---
-        latent_reg = sigma * (z_shape ** 2).sum()
+        latent_reg = sigma * (z_shape ** 2).sum() if self.regularize_latent else torch.tensor(0.0, device=self.device)
 
         # --- Expand latent to per-point ---
         z = z_shape[:, None, :].expand(B, N, -1).reshape(-1, z_shape.shape[1])
@@ -126,7 +133,7 @@ class DeepSDFTrainer:
 
         # --- Data term ---
         pred = self.model(x, z)
-        data_loss = clamped_l1_loss(pred, s, self.clamp_delta).sum()
+        data_loss = clamped_l1_loss(pred, s, self.clamp_delta).sum() if self.clamp_delta is not None else l1_loss(pred, s).sum()
 
         # --- Total loss ---
         loss = data_loss + latent_reg
@@ -213,7 +220,7 @@ def infer_latent(model: DeepSDF, points: torch.Tensor, sdf: torch.Tensor,
         z_rep = z.expand(points.shape[0], -1)
         pred = model(points, z_rep)
 
-        data_loss = clamped_l1_loss(pred, sdf, clamp_delta).mean()
+        data_loss = clamped_l1_loss(pred, sdf, clamp_delta).mean() if clamp_delta is not None else l1_loss(pred, sdf).mean()
         latent_reg = (z ** 2).sum() / (latent_sigma ** 2)
         loss = data_loss + latent_reg
 

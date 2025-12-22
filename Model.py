@@ -84,8 +84,17 @@ class Model:
         num_epochs: int = 500,
         scenes_per_batch: int = 1,
         device: str = "cpu",
+        training_clamp_dist: float|None = 0.1,
+        sample_clamp_dist: float = 0.1,
+        samples_per_scene: int = 5000,
+        regularize_latent: bool = False,    latent_injection_layer: int = 4,
+    
+        soft_latent: bool = True,
     ):
         self.base_directory = base_directory
+        self.regularize_latent = regularize_latent
+        self.soft_latent = soft_latent
+    
         self.model_name = model_name
         self.scenes = scenes
         self.domain_radius = domain_radius
@@ -93,6 +102,10 @@ class Model:
         self.num_epochs = num_epochs
         self.scenes_per_batch = scenes_per_batch
         self.device = device
+        self.training_clamp_dist = training_clamp_dist
+        self.sample_clamp_dist = sample_clamp_dist
+        self.samples_per_scene = samples_per_scene
+        self.latent_injection_layer = latent_injection_layer
 
         self.trained_scenes: Dict[str, Scene] = {}
 
@@ -272,8 +285,8 @@ class Model:
     def train(self):
         print("[INFO] Sampling scenes")
 
-        clamp_dist = 0.1
-        samples_per_scene = 5000
+  
+        
 
         scene_samples: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
 
@@ -281,8 +294,8 @@ class Model:
             print(f"[SAMPLE] Scene '{scene_id}'")
             pts, sdf = self._sample_scene(
                 scene,
-                samples_per_scene,
-                clamp_dist,
+                self.samples_per_scene,
+                clamp_dist=self.sample_clamp_dist,
             )
             scene_samples[idx] = (pts, sdf)
 
@@ -305,7 +318,8 @@ class Model:
             latent_dim=self.latent_dim,
             hidden_dim=512,
             num_layers=8,
-            latent_injection_layer=4,
+            latent_injection_layer=self.latent_injection_layer,
+            soft_latent=self.soft_latent,
         )
 
         trainer = DeepSDFTrainer(
@@ -313,8 +327,9 @@ class Model:
             base_directory=self.base_directory,
             num_shapes=len(self.scenes),
             latent_dim=self.latent_dim,
-            clamp_delta=clamp_dist,
+            clamp_delta= self.training_clamp_dist,
             device=self.device,
+            regularize_latent=self.regularize_latent,
         )
 
         print(f"[INFO] Training for {self.num_epochs} epochs")
@@ -322,7 +337,7 @@ class Model:
         trainer.train(
             dataloader=loader,
             epochs=self.num_epochs,
-            snapshot_every=200  # saves every 200 epochs
+            snapshot_every=100  # saves every 100 epochs
         )
 
         self.model = model
@@ -378,7 +393,6 @@ class Model:
         self,
         key: str,
         latent: torch.Tensor,
-        grid_center=(0.0, 0.0, 0.0),
         grid_res=128,
         clamp_dist=0.1,
         param_values=None,
@@ -400,7 +414,6 @@ class Model:
         xyz_points, x, y, z = self.build_dynamic_sampling_grid(
             latent_vector=latent_vector,
             grid_res=grid_res,
-            grid_center=grid_center,
             device=device,
         )
 
@@ -443,27 +456,13 @@ class Model:
             meshes.append(mesh)
 
         return meshes
-
-
-    def _build_grid(self, grid_center=(0.0, 0.0, 0.0), grid_res=128):
-        """
-        Internal helper: create a uniform sampling grid around a center.
-        """
-        bbox_half = 1.0
-        x = np.linspace(grid_center[0] - bbox_half, grid_center[0] + bbox_half, grid_res)
-        y = np.linspace(grid_center[1] - bbox_half, grid_center[1] + bbox_half, grid_res)
-        z = np.linspace(grid_center[2] - bbox_half, grid_center[2] + bbox_half, grid_res)
-        grid = np.stack(np.meshgrid(x, y, z, indexing="ij"), axis=-1)
-        pts_flat = torch.from_numpy(grid.reshape(-1, 3)).float()
-        return pts_flat, x, y, z
     
     def build_dynamic_sampling_grid(
         self,
         latent_vector: torch.Tensor,
         grid_res: int,
-        grid_center=(0.0, 0.0, 0.0),
         init_range: float = 3.0,
-        probe_N: int = 200_000,
+        probe_N: int = 500_000,
         surface_thresh: float = 0.3,
         n_surface_probes: int = 2048,
         bbox_margin_ratio: float = 0.12,

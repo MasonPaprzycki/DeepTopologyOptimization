@@ -55,7 +55,7 @@ def main():
             )._compute(xyz)
         return sdf_fn
 
-    num_scenes = 5
+    num_scenes = 20
     x_positions = np.linspace(-0.8, 0.8, num_scenes)
 
     scenes = {
@@ -73,7 +73,11 @@ def main():
         model_name="SlidingSphereModel2D",
         scenes=scenes,
         latent_dim=1,
-        num_epochs=200,
+        num_epochs=1000,
+        training_clamp_dist=None,
+        latent_injection_layer=1,
+        regularize_latent=False,
+        soft_latent=True,
     )
 
     print("[INFO] Training model...")

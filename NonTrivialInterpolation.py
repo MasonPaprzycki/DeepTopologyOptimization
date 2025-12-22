@@ -104,9 +104,9 @@ scenes = {
 }
 
 # Visualize analytic SDFs prior to training
-visualize_analytic_sdf(analytic_torus_sdf, "torus", EXPERIMENT_ROOT, grid_res=128)
-visualize_analytic_sdf(wavey_rounded_box_sdf, "wavey_rounded_box", EXPERIMENT_ROOT, grid_res=128)
-visualize_analytic_sdf(dented_sphere_sdf, "dented_sphere", EXPERIMENT_ROOT, grid_res=128)
+visualize_analytic_sdf(analytic_torus_sdf, "torus", EXPERIMENT_ROOT, grid_res=256)
+visualize_analytic_sdf(wavey_rounded_box_sdf, "wavey_rounded_box", EXPERIMENT_ROOT, grid_res=256)
+visualize_analytic_sdf(dented_sphere_sdf, "dented_sphere", EXPERIMENT_ROOT, grid_res=256)
 
 # ======================================================
 # Train DeepSDF model
@@ -116,9 +116,12 @@ model = Model.Model(
     model_name="SplineSymmetryExperiment",
     scenes=scenes,
     latent_dim=3,  # 3D latent vector corresponds to three shapes
-    num_epochs=1000,
+    num_epochs=1200,
     domain_radius=1.0,
     device="cpu",
+    regularize_latent=True,
+    soft_latent=True,
+    samples_per_scene=10000
 )
 
 model.train()
@@ -153,7 +156,7 @@ p0, p1, p2 = latents
 p3 = p2 + (p2 - p1)
 
 # Interpolation continuity parameters
-ts = torch.linspace(0, 1, 30)  # 30 frames per segment
+ts = torch.linspace(0, 1, 60)  # 60 frames per segment
 gif_frames = []
 mesh_output_dir = os.path.join(EXPERIMENT_ROOT, "Meshes")
 os.makedirs(mesh_output_dir, exist_ok=True)
@@ -183,7 +186,7 @@ for seg_idx, (name_start, name_end) in enumerate(segments):
         meshes = model.visualize_a_shape(
             latent=z_interp,
             key=scene.scene_key,
-            grid_res=96,
+            grid_res=256,
             clamp_dist=0.1,
             param_values=None,
             save_suffix=f"{seg_idx}_{i:03d}",
