@@ -5,9 +5,9 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 from skimage import measure
+import pyrender
+from PIL import Image, ImageEnhance, ImageFilter
 import trimesh
-
-
 SDFCallable = Callable[[torch.Tensor, Optional[torch.Tensor]], torch.Tensor]
 SceneWithOperators = Dict[int, Tuple[SDFCallable, List[Tuple[float, float]]]]
 Scenes = Dict[str, SceneWithOperators]
@@ -87,8 +87,8 @@ class Model:
         training_clamp_dist: float|None = 0.1,
         sample_clamp_dist: float = 0.1,
         samples_per_scene: int = 5000,
-        regularize_latent: bool = False,    latent_injection_layer: int = 4,
-    
+        regularize_latent: bool = False,
+        latent_injection_layer: int | None = 4,
         soft_latent: bool = True,
     ):
         self.base_directory = base_directory
@@ -111,11 +111,114 @@ class Model:
 
         os.makedirs(self.base_directory, exist_ok=True)
 
+    @classmethod
+    def from_snapshot(
+        cls,
+        snapshot_path: str,
+        *,
+        base_directory: str,
+        model_name: str,
+        latent_injection_layer: int | None = None,
+        soft_latent: bool = True,
+        device: str = "cpu",
+    ):
+        """
+        Load a trained DeepSDF Model from a snapshot .pth file for inference.
+        Fully reconstructs the decoder to match checkpoint shapes exactly.
+        """
+        device = torch.device(device)
+        ckpt = torch.load(snapshot_path, map_location=device)
+        state_dict = ckpt["model_state_dict"]
+
+        # --------------------------------------------------
+        # Determine decoder parameters from checkpoint
+        # --------------------------------------------------
+        layer_keys = sorted([k for k in state_dict.keys() if k.startswith("layers.") and k.endswith("weight")])
+        num_layers = len(layer_keys)
+        first_layer_weight = state_dict[layer_keys[0]]
+        hidden_dim = first_layer_weight.shape[0]
+        input_dim_with_latent = first_layer_weight.shape[1]  # includes latent concat
+
+        latent_state = ckpt["latent_codes"]
+        latent_dim = latent_state["weight"].shape[1]
+
+        # Infer latent injection layer if not provided
+        if latent_injection_layer is None:
+            latent_injection_layer = None
+            for i, k in enumerate(layer_keys[1:], start=1):
+                w = state_dict[k]
+                if w.shape[1] == hidden_dim + latent_dim:
+                    latent_injection_layer = i
+                    break
+
+        # Compute actual input_dim to pass to DeepSDF (subtract latent_dim)
+        input_dim = input_dim_with_latent - latent_dim
+
+        print(f"[INFO] Inferred decoder: input_dim={input_dim}, hidden_dim={hidden_dim}, "
+            f"num_layers={num_layers}, latent_dim={latent_dim}, latent_injection_layer={latent_injection_layer}")
+
+        # --------------------------------------------------
+        # Rebuild decoder exactly
+        # --------------------------------------------------
+        decoder = DeepSDF(
+            input_dim=input_dim,
+            latent_dim=latent_dim,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            latent_injection_layer=latent_injection_layer,
+            soft_latent=soft_latent,
+        ).to(device)
+
+        decoder.load_state_dict(state_dict)
+        decoder.eval()
+
+        # --------------------------------------------------
+        # Instantiate empty model shell
+        # --------------------------------------------------
+        model_obj = cls(
+            base_directory=base_directory,
+            model_name=model_name,
+            scenes={},  # inference-only
+            latent_dim=latent_dim,
+            latent_injection_layer=latent_injection_layer,
+            soft_latent=soft_latent,
+            device=str(device),
+            num_epochs=0,
+        )
+        model_obj.model = decoder
+        model_obj.trainer = None
+
+        # --------------------------------------------------
+        # Load latent embedding
+        # --------------------------------------------------
+        latent_embedding = torch.nn.Embedding(
+            num_embeddings=latent_state["weight"].shape[0],
+            embedding_dim=latent_state["weight"].shape[1],
+        )
+        latent_embedding.load_state_dict(latent_state)
+        latent_embedding = latent_embedding.to(device)
+
+        # Register latents
+        model_obj.trained_scenes = {}
+        for idx in range(latent_embedding.weight.shape[0]):
+            key = f"{model_name.lower()}_latent_{idx}"
+            model_obj.trained_scenes[key] = latent_embedding.weight[idx].detach().cpu()
+
+        print(
+            f"[INFO] Loaded model from snapshot '{snapshot_path}' "
+            f"(epoch {ckpt.get('epoch', 'unknown')}) "
+            f"with {len(model_obj.trained_scenes)} latent vectors"
+        )
+
+        return model_obj
+
+
+
     def _sample_scene(
         self,
         scene: SceneWithOperators,
         samples_per_scene: int,
-        clamp_dist: float,
+        clamp_dist: float = 0.1,
         outlier_pct: float = 0.05,
     ):
         """
@@ -285,11 +388,7 @@ class Model:
     def train(self):
         print("[INFO] Sampling scenes")
 
-  
-        
-
         scene_samples: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
-
         for idx, (scene_id, scene) in enumerate(self.scenes.items()):
             print(f"[SAMPLE] Scene '{scene_id}'")
             pts, sdf = self._sample_scene(
@@ -337,7 +436,7 @@ class Model:
         trainer.train(
             dataloader=loader,
             epochs=self.num_epochs,
-            snapshot_every=100  # saves every 100 epochs
+            snapshot_every=500 # saves every 100 epochs
         )
 
         self.model = model
@@ -391,12 +490,10 @@ class Model:
     
     def visualize_a_shape(
         self,
-        key: str,
         latent: torch.Tensor,
-        grid_res=128,
+        grid_res=160,
         clamp_dist=0.1,
         param_values=None,
-        save_suffix=None,
     ):
         if param_values is None:
             param_values = [None]
@@ -432,6 +529,7 @@ class Model:
             ).cpu().numpy()
 
             volume = np.clip(sdf.reshape(grid_res, grid_res, grid_res), -clamp_dist, clamp_dist)
+            print("SDF min:", sdf.min(), "max:", sdf.max())
             if not (volume.min() < 0 < volume.max()):
                 continue
 
@@ -440,19 +538,6 @@ class Model:
             verts = verts * scale + np.array([x[0], y[0], z[0]])
 
             mesh = trimesh.Trimesh(verts, faces, vertex_normals=normals)
-
-            mesh_dir = os.path.join(self.base_directory, "Meshes")
-            os.makedirs(mesh_dir, exist_ok=True)
-
-            suffix = f"_case{idx:02d}"
-            if save_suffix:
-                suffix += f"_{save_suffix}"
-
-            mesh_path = os.path.join(
-                mesh_dir, f"{self.model_name.lower()}_{key}{suffix}_mesh.ply"
-            )
-
-            mesh.export(mesh_path)
             meshes.append(mesh)
 
         return meshes
@@ -572,3 +657,160 @@ class Scene:
 
 
 
+
+def render_mesh_isometric(mesh: trimesh.Trimesh, resolution=(500, 500)):
+    """
+    Render a trimesh mesh in an isometric view using pyrender offscreen.
+    
+    Parameters:
+        mesh: trimesh.Trimesh
+            The mesh to render.
+        resolution: tuple(int, int)
+            Image resolution (width, height).
+    
+    Returns:
+        numpy.ndarray
+            Rendered image as an array of shape (H, W, 3) in RGB.
+    """
+    # Create a pyrender scene
+    scene = pyrender.Scene(bg_color=[255, 255, 255], ambient_light=[0.5, 0.5, 0.5])
+
+    # Convert trimesh mesh to pyrender mesh and add to scene
+    mesh_pyr = pyrender.Mesh.from_trimesh(mesh, smooth=False)
+    scene.add(mesh_pyr)
+
+    # Camera setup: isometric-like view
+    # We'll compute a distance that frames the mesh
+    bounds = mesh.bounds
+    center = bounds.mean(axis=0)
+    size = np.linalg.norm(bounds[1] - bounds[0])
+    if size < 1e-6:
+        size = 1.0
+
+    # Simple rotation matrix for an isometric-ish view
+    # Pitch down 45 deg, yaw 0 deg, roll 15 deg
+    pitch, yaw, roll = np.radians([45, 0, 15])
+    Rx = np.array([[1, 0, 0],
+                   [0, np.cos(pitch), -np.sin(pitch)],
+                   [0, np.sin(pitch), np.cos(pitch)]])
+    Ry = np.array([[np.cos(yaw), 0, np.sin(yaw)],
+                   [0, 1, 0],
+                   [-np.sin(yaw), 0, np.cos(yaw)]])
+    Rz = np.array([[np.cos(roll), -np.sin(roll), 0],
+                   [np.sin(roll), np.cos(roll), 0],
+                   [0, 0, 1]])
+    R = Rz @ Ry @ Rx
+
+    # Camera position
+    cam_distance = size * 2.0
+    cam_position = center + R @ np.array([0, 0, cam_distance])
+    cam_target = center
+
+    # Compute look-at matrix
+    def look_at(cam_pos, target):
+        forward = (target - cam_pos)
+        forward /= np.linalg.norm(forward)
+        right = np.cross([0, 0, 1], forward)
+        if np.linalg.norm(right) < 1e-6:
+            right = np.array([1, 0, 0])
+        right /= np.linalg.norm(right)
+        up = np.cross(forward, right)
+        mat = np.eye(4)
+        mat[:3, 0] = right
+        mat[:3, 1] = up
+        mat[:3, 2] = forward
+        mat[:3, 3] = cam_pos
+        return mat
+
+    camera = pyrender.PerspectiveCamera(yfov=np.pi / 3.0)
+    cam_node = scene.add(camera, pose=look_at(cam_position, cam_target))
+
+    # Add a simple directional light
+    light = pyrender.DirectionalLight(color=np.ones(3), intensity=2.0)
+    scene.add(light, pose=np.eye(4))
+
+    # Offscreen renderer
+    r = pyrender.OffscreenRenderer(*resolution)
+    color, depth = r.render(scene)
+    r.delete()
+
+    return color  # RGB image as numpy array
+
+
+
+def render_mesh_isometric_pil(mesh: trimesh.Trimesh,
+                         resolution=(500,500),
+                         pitch_deg=-45,
+                         yaw_deg=15,
+                         distance_factor=1.2,
+                         contrast_factor=3,
+                         sharpen=True) -> Image.Image:
+    """
+    Render mesh centered in the image. Mesh rotation defines the view (pitch/yaw),
+    while the camera stays on +Z to avoid projection offsets.
+    """
+    mesh_copy = mesh.copy()
+    center = mesh_copy.bounds.mean(axis=0)
+    mesh_copy.apply_translation(-center)
+
+    # Rotate mesh for isometric view
+    pitch = np.radians(pitch_deg)
+    yaw = np.radians(yaw_deg)
+    R_pitch = trimesh.transformations.rotation_matrix(pitch, [1,0,0])
+    R_yaw = trimesh.transformations.rotation_matrix(yaw, [0,1,0])
+    mesh_copy.apply_transform(R_yaw @ R_pitch)
+
+    # Scene
+    scene = pyrender.Scene(
+    bg_color=[220, 220, 220],
+    ambient_light=[0.03, 0.03, 0.03]  # NOT 0.2
+    )
+
+    blue_material = pyrender.MetallicRoughnessMaterial(
+    baseColorFactor=[0.18, 0.35, 0.85, 1.0],
+  # deep but not saturated blue
+    metallicFactor=0.1,
+    roughnessFactor=0.4
+    )
+
+    scene.add(
+        pyrender.Mesh.from_trimesh(
+            mesh_copy,
+            material=blue_material,
+            smooth=True
+        )
+    )
+
+
+    # Camera: fixed on +Z looking at origin
+    diag = np.linalg.norm(mesh_copy.extents)
+    cam_distance = diag * distance_factor
+    camera = pyrender.PerspectiveCamera(yfov=np.pi/3.0)
+    cam_pose = np.eye(4)
+    cam_pose[:3,3] = [0,0,cam_distance]  # +Z
+    scene.add(camera, pose=cam_pose)
+
+    # Lights: relative to camera
+    scene.add(pyrender.DirectionalLight(color=np.ones(3), intensity=5.0),
+              pose=cam_pose)
+    scene.add(pyrender.DirectionalLight(color=np.ones(3), intensity=2.0),
+              pose=cam_pose)
+    scene.add(pyrender.DirectionalLight(color=np.ones(3), intensity=1.0),
+              pose=cam_pose)
+
+    # Render
+    r = pyrender.OffscreenRenderer(*resolution)
+    color, _ = r.render(scene)
+    r.delete()
+
+    img = Image.fromarray(color[:, :, :3])
+
+    # Boost contrast
+    if contrast_factor != 1.0:
+        img = ImageEnhance.Contrast(img).enhance(contrast_factor)
+
+    # Sharpen
+    if sharpen:
+        img = img.filter(ImageFilter.UnsharpMask(radius=1, percent=200, threshold=3))
+
+    return img

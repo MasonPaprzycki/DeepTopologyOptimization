@@ -58,8 +58,11 @@ model = Model.Model(
     model_name="TrainOnASphereModel",
     scenes=scenes,
     latent_dim=1,
-    num_epochs=100,
+    num_epochs=1000,
     domain_radius=0.45,
+    regularize_latent=True,
+    training_clamp_dist=0.1,
+    samples_per_scene=10000,
     device="cpu",  # Force CPU to avoid CUDA errors
 )
 
@@ -95,12 +98,9 @@ if __name__ == "__main__":
 # and a trained scene registered as "trainonaspheremodel_0" (or whatever key you used)
 
     meshes = model.visualize_a_shape(
-        key="trainonaspheremodel_0",
         latent=latent,  # must match the key in trained_scenes
-        grid_res=96,
+        grid_res=128,
         clamp_dist=0.1,
-        save_suffix="single",
-        grid_center=(0.0, 0.0, 0.0),
     )
 
 
@@ -109,52 +109,10 @@ if __name__ == "__main__":
         print("[INFO] Done.")
         quit()
 
-    # Locate the exported mesh
+    mesh = meshes[0]
     mesh_dir = os.path.join(EXPERIMENT_ROOT, "Meshes")
-    all_mesh_files = [
-        f for f in os.listdir(mesh_dir)
-        if f.endswith(".ply") and f.startswith("trainonaspheremodel")
-    ]
-    if not all_mesh_files:
-        raise FileNotFoundError("Mesh should have been exported by VisualizeAShape but none found.")
+    os.makedirs(mesh_dir, exist_ok=True)
+    mesh.export(os.path.join(mesh_dir, "trained_sphere_mesh.ply"))
+    print(f"[INFO] Exported trained sphere mesh to {mesh_dir}/trained_sphere_mesh.ply")
 
-    all_mesh_files.sort()
-    final_mesh_path = os.path.join(mesh_dir, all_mesh_files[-1])
-    print(f"[INFO] Using exported mesh: {final_mesh_path}")
-
-    mesh = trimesh.load(final_mesh_path)
-
-    # ======================================================
-    # Static render
-    # ======================================================
-    if hasattr(mesh, "geometry") and isinstance(mesh.geometry, dict):
-        geom_list = [
-            geom for geom in mesh.geometry.values()
-            if hasattr(geom, "vertices") and hasattr(geom, "faces")
-        ]
-        mesh = trimesh.util.concatenate(geom_list)
-
-    fig = plt.figure(figsize=(5,5))
-    ax = fig.add_subplot(111, projection='3d')
-    ax.add_collection3d(Poly3DCollection(
-        mesh.vertices[mesh.faces],
-        facecolor='lightblue',
-        edgecolor='k',
-        linewidth=0.1,
-        alpha=1.0
-    ))
-
-    ax.set_xlim(-1, 1)
-    ax.set_ylim(-1, 1)
-    ax.set_zlim(-1, 1)
-    ax.view_init(elev=25, azim=30)
-    ax.set_box_aspect([1, 1, 1])
-    plt.axis('off')
-
-    render_path = os.path.join(EXPERIMENT_ROOT, "plots", "trained_sphere_render.png")
-    plt.savefig(render_path, dpi=200, bbox_inches='tight')
-    plt.close()
-
-    print(f"[INFO] Render saved to: {render_path}")
-    print("[INFO] Done.")
-
+   

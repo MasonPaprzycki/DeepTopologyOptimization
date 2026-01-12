@@ -1,3 +1,5 @@
+import Model
+from PIL import Image, ImageDraw, ImageFont 
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
@@ -7,6 +9,7 @@ from skimage import measure
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import os
 import torch
+import io
 
 def visualize_analytic_sdf(
     sdf_fn,
@@ -54,41 +57,21 @@ def visualize_analytic_sdf(
     verts = verts * scale + np.array([x[0], y[0], z[0]])
 
     mesh = trimesh.Trimesh(vertices=verts, faces=faces, vertex_normals=normals)
-
+    
     mesh_dir = os.path.join(out_root, "Meshes")
     plot_dir = os.path.join(out_root, "plots")
     os.makedirs(mesh_dir, exist_ok=True)
     os.makedirs(plot_dir, exist_ok=True)
 
+    # --- save mesh ---
     mesh_path = os.path.join(mesh_dir, f"analytic_{name}.ply")
     mesh.export(mesh_path)
+
     print(f"[ANALYTIC] Mesh saved → {mesh_path}")
 
-    # --------------------------------------------------
-    # Static render
-    # --------------------------------------------------
-    fig = plt.figure(figsize=(5, 5))
-    ax = fig.add_subplot(111, projection="3d")
-
-    ax.add_collection3d(
-        Poly3DCollection(
-            mesh.vertices[mesh.faces],
-            facecolor="lightblue",
-            edgecolor="k",
-            linewidth=0.05,
-            alpha=1.0,
-        )
-    )
-
-    ax.set_xlim(-bbox_half, bbox_half)
-    ax.set_ylim(-bbox_half, bbox_half)
-    ax.set_zlim(-bbox_half, bbox_half)
-    ax.set_box_aspect([1, 1, 1])
-    ax.view_init(elev=25, azim=30)
-    ax.axis("off")
-
+    # --- fast render scene  ---
+    img = Model.render_mesh_isometric_pil(mesh)
     render_path = os.path.join(plot_dir, f"analytic_{name}.png")
-    plt.savefig(render_path, dpi=200, bbox_inches="tight")
-    plt.close()
-
+    img.save(render_path)
     print(f"[ANALYTIC] Render saved → {render_path}")
+

@@ -24,27 +24,30 @@ def l1_loss(pred, target):
     return torch.abs(pred - target)
 
 
-# -----------------------------
-# DeepSDF Network
-# -----------------------------
 class DeepSDF(nn.Module):
-    """DeepSDF MLP with latent injection at input and mid-network."""
+    """DeepSDF MLP with latent injection at input and optionally at mid-network."""
     def __init__(self, input_dim, latent_dim=256, hidden_dim=512,
-                 num_layers=8, latent_injection_layer=4, soft_latent=True):
+                num_layers=8, latent_injection_layer=None, soft_latent=True):
         super().__init__()
+
         self.latent_injection_layer = latent_injection_layer
         self.soft_latent = soft_latent
 
-        layers = nn.ModuleList()
-        layers.append(nn.Linear(input_dim + latent_dim, hidden_dim))
-        for i in range(1, num_layers):
-            if i == latent_injection_layer:
-                layers.append(nn.Linear(hidden_dim + latent_dim, hidden_dim))
-            else:
-                layers.append(nn.Linear(hidden_dim, hidden_dim))
+        self.layers = nn.ModuleList()
 
-        self.layers = layers
+        # First layer: ALWAYS inject latent
+        self.layers.append(nn.Linear(input_dim + latent_dim, hidden_dim))
+
+        # Hidden layers
+        for i in range(1, num_layers):
+            if latent_injection_layer is not None and i == latent_injection_layer:
+                self.layers.append(nn.Linear(hidden_dim + latent_dim, hidden_dim))
+            else:
+                self.layers.append(nn.Linear(hidden_dim, hidden_dim))
+
+        # Output layer
         self.final = nn.Linear(hidden_dim, 1)
+
         self.activation = nn.Softplus(beta=100) if soft_latent else nn.ReLU(inplace=True)
 
         self._init_weights()
@@ -56,17 +59,27 @@ class DeepSDF(nn.Module):
                 nn.init.constant_(m.bias, 0.0)
 
     def forward(self, x, z):
+        """
+        Forward pass for DeepSDF.
+
+        Args:
+            x: (B, input_dim) coordinate points
+            z: (B, latent_dim) latent vector
+        Returns:
+            (B, 1) SDF predictions
+        """
+        # Always inject latent at input
         h = torch.cat([x, z], dim=1)
+
         for i, layer in enumerate(self.layers):
-            if i == self.latent_injection_layer:
+            # Inject latent at hidden layer only if specified
+            if self.latent_injection_layer is not None and i == self.latent_injection_layer:
                 h = torch.cat([h, z], dim=1)
             h = self.activation(layer(h))
+
         return self.final(h)
 
 
-# -----------------------------
-# Dataset
-# -----------------------------
 class SDFDataset(Dataset):
     """Dataset for shapes: each item is (shape_id, points[N,D], sdf[N,1])"""
     def __init__(self, data):
@@ -82,9 +95,7 @@ class SDFDataset(Dataset):
         return sid, pts, sdf
 
 
-# -----------------------------
-# Trainer
-# -----------------------------
+
 class DeepSDFTrainer:
     """Trainer for DeepSDF auto-decoder."""
     def __init__(self, base_directory, model, num_shapes, latent_dim=256, sigma0=1e-4,
@@ -199,9 +210,6 @@ class DeepSDFTrainer:
         print(f"[INFO] Loss curve saved → {save_path}")
 
 
-# -----------------------------
-# Latent inference
-# -----------------------------
 def infer_latent(model: DeepSDF, points: torch.Tensor, sdf: torch.Tensor,
                  latent_dim: int = 256, latent_sigma: float = 0.01,
                  lr: float = 1e-3, iters: int = 800, clamp_delta: float = 0.1,
