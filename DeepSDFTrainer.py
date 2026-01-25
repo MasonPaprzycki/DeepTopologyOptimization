@@ -183,11 +183,12 @@ class DeepSDFTrainer:
             self.loss_history["total"].append(epoch_total / len(dataloader))
             self.loss_history["data"].append(epoch_data / len(dataloader))
             self.loss_history["latent_reg"].append(epoch_latent / len(dataloader))
+            print(f"[{epoch:04d}] total_loss={epoch_total:.6e} "
+                f"data_loss={epoch_data:.6e} latent_reg={epoch_latent:.6e}")
 
             if epoch % snapshot_every == 0:
                 self.save_snapshot(epoch)
-                print(f"[{epoch:04d}] total_loss={epoch_total:.6e} "
-                    f"data_loss={epoch_data:.6e} latent_reg={epoch_latent:.6e}")
+               
                 
         self.plot_losses()
 

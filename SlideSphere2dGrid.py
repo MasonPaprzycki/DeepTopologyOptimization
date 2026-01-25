@@ -56,7 +56,7 @@ def main():
             return analytic_sphere_sdf(xyz, params={"cx": cx, "cy": cy})
         return sdf_fn
 
-    num_scenes_per_axis = 10
+    num_scenes_per_axis = 12
     x_positions = np.linspace(-0.8, 0.8, num_scenes_per_axis)
     y_positions = np.linspace(-0.8, 0.8, num_scenes_per_axis)
 
@@ -84,6 +84,7 @@ def main():
         latent_injection_layer=4,
         regularize_latent=False,
         soft_latent=True,
+        
     )
 
     print("[INFO] Training model...")
@@ -95,7 +96,7 @@ def main():
     # -------------------------------
     # Get latent extremes (corner latents)
     # -------------------------------
-    latents = torch.stack(list(model.trained_scenes.values())).float()
+    latents = torch.stack([scene.get_latent_vector() for scene in model.trained_scenes.values()]).float()
     latent_min = latents.min(dim=0).values
     latent_max = latents.max(dim=0).values
     print("[INFO] Latent min/max:", latent_min, latent_max)
