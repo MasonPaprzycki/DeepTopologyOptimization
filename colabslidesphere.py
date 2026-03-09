@@ -90,7 +90,7 @@ def main():
         num_epochs=4000,
         training_clamp_dist=None,
         sample_clamp_dist=0.5,
-        latent_injection_layer=4,
+        skip_layer=4,
         regularize_latent=False,
         soft_latent=True,
         device=device,

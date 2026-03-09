@@ -27,26 +27,27 @@ def l1_loss(pred, target):
 class DeepSDF(nn.Module):
     """DeepSDF MLP with latent injection at input and optionally at mid-network."""
     def __init__(self, input_dim, latent_dim=256, hidden_dim=512,
-                num_layers=8, latent_injection_layer=None, soft_latent=True):
+                num_layers=8, skip_layer=None, soft_latent=True,weight_norm=False):
         super().__init__()
 
-        self.latent_injection_layer = latent_injection_layer
+        self.skip_layer = skip_layer
         self.soft_latent = soft_latent
+        self.weight_norm = weight_norm
 
         self.layers = nn.ModuleList()
 
         # First layer: ALWAYS inject latent
-        self.layers.append(nn.Linear(input_dim + latent_dim, hidden_dim))
+        self.layers.append(nn.utils.weight_norm(nn.Linear(input_dim + latent_dim, hidden_dim))) if weight_norm else self.layers.append(nn.Linear(input_dim + latent_dim, hidden_dim))
 
         # Hidden layers
         for i in range(1, num_layers):
-            if latent_injection_layer is not None and i == latent_injection_layer:
-                self.layers.append(nn.Linear(hidden_dim + latent_dim, hidden_dim))
+            if skip_layer is not None and i == skip_layer:
+                self.layers.append(nn.utils.weight_norm(nn.Linear(hidden_dim+ input_dim + latent_dim, hidden_dim))) if self.weight_norm else self.layers.append(nn.Linear(hidden_dim+ input_dim + latent_dim, hidden_dim))
             else:
-                self.layers.append(nn.Linear(hidden_dim, hidden_dim))
+                self.layers.append(nn.utils.weight_norm(nn.Linear(hidden_dim, hidden_dim))) if self.weight_norm else self.layers.append(nn.Linear(hidden_dim, hidden_dim))
 
         # Output layer
-        self.final = nn.Linear(hidden_dim, 1)
+        self.final = nn.utils.weight_norm(nn.Linear(hidden_dim, 1)) if self.weight_norm else nn.Linear(hidden_dim, 1)
 
         self.activation = nn.Softplus(beta=100) if soft_latent else nn.ReLU(inplace=True)
 
@@ -73,8 +74,8 @@ class DeepSDF(nn.Module):
 
         for i, layer in enumerate(self.layers):
             # Inject latent at hidden layer only if specified
-            if self.latent_injection_layer is not None and i == self.latent_injection_layer:
-                h = torch.cat([h, z], dim=1)
+            if self.skip_layer is not None and i == self.skip_layer:
+                h = torch.cat([h,x, z], dim=1)
             h = self.activation(layer(h))
 
         return self.final(h)
@@ -99,23 +100,30 @@ class SDFDataset(Dataset):
 class DeepSDFTrainer:
     """Trainer for DeepSDF auto-decoder."""
     def __init__(self, base_directory, model, num_shapes, latent_dim=256, sigma0=1e-4,
-                 lr_net=5e-4, lr_latent=1e-3, clamp_delta=None, device="cpu",regularize_latent: bool = True):
+                 lr_net=5e-4, lr_latent=1e-3, clamp_delta=0.1,regularize_latent: bool = True, weight_norm: bool = False, subsample_clamp_dist=0.1, device=None):
         
         self.base_directory = base_directory
-        self.device = device
+        self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
         self.regularize_latent = regularize_latent
-        self.model = model.to(device)
+        self.model = model.to(self.device)
         self.sigma0 = sigma0
         self.clamp_delta = clamp_delta
         self.save_dir = os.path.join(base_directory, "snapshots")
+        self.subsample_clamp_dist = subsample_clamp_dist
         os.makedirs(self.save_dir, exist_ok=True)
 
         # Initialize latent codes
         self.latents = nn.Embedding(num_shapes, latent_dim)
         nn.init.normal_(self.latents.weight, mean=0.0, std=0.01)
-        self.latents = self.latents.to(device)
+        self.latents = self.latents.to(self.device)
 
         # Optimizer: separate learning rates for network and latents
+        optim.Adam([
+            {"params": self.model.parameters(), "lr": lr_net},
+            {"params": self.latents.parameters(), "lr": lr_latent},
+        ])
         self.optimizer = optim.Adam([
             {"params": self.model.parameters(), "lr": lr_net},
             {"params": self.latents.parameters(), "lr": lr_latent},
@@ -124,36 +132,167 @@ class DeepSDFTrainer:
         # Loss history for plotting
         self.loss_history = {"total": [], "data": [], "latent_reg": []}
 
-    def train_step(self, shape_ids, points, sdf, sigma):
-        """Single training step implementing Eq. (6)."""
-        B, N, D = points.shape
+    def train_step(
+            self, 
+            shape_ids,
+            points_pos,
+            points_neg,
+            points_pos_outlier,
+            points_neg_outlier,
+            sdf_pos, 
+            sdf_neg, 
+            sdf_pos_outlier, 
+            sdf_neg_outlier, 
+            sigma):
+        """
+        Single training step for a batch of shapes.
+
+        Args:
+            shape_ids: (B,) tensor of shape indices
+            points: (B, N, D) tensor of input coordinates
+            sdf: (B, N, 1) tensor of SDF values
+            sigma: float, latent regularization weight
+
+        Returns:
+            loss, data_loss, latent_reg
+        """
+        # Move to device
+        points_pos = points_pos.to(self.device)
+        points_neg = points_neg.to(self.device)
+        points_pos_outlier = points_pos_outlier.to(self.device)
+        points_neg_outlier = points_neg_outlier.to(self.device)
+
+        #points = points.to(self.device)
+   
+        sdf_pos= sdf_pos.to(self.device)
+        sdf_neg= sdf_neg.to(self.device)
+        sdf_pos_outlier =sdf_pos_outlier.to(self.device)
+        sdf_neg_outlier = sdf_neg_outlier.to(self.device)
+
         shape_ids = shape_ids.to(self.device)
-        points = points.to(self.device)
-        sdf = sdf.to(self.device)
+      
+        B_pos, N_pos, D_pos = points_pos.shape
+        B_neg, N_neg, D_neg = points_neg.shape
+        B_pos_out, N_pos_out, D_pos_out = points_pos_outlier.shape
+        B_neg_out, N_neg_out, D_neg_out = points_neg_outlier.shape
 
-        # --- Latent per shape ---
+        # SAFE lengths for indexing
+        N_pos = sdf_pos.shape[1]
+        N_neg = sdf_neg.shape[1]
+        N_pos_out = sdf_pos_outlier.shape[1]
+        N_neg_out = sdf_neg_outlier.shape[1]
+
+        total_target_samples = 5000
+        near_ratio = 0.95
+        far_ratio = 1.0 - near_ratio
+        half_samples =int(total_target_samples * near_ratio / 2)
+        pos_num_samples = min(half_samples, N_pos)
+        neg_num_samples = min(half_samples, N_neg)
+        far_half_samples = int(total_target_samples * far_ratio / 2)
+        pos_out_num_samples = min(far_half_samples, N_pos_out)
+        neg_out_num_samples = min(far_half_samples, N_neg_out)
+
+        #Random subsampling keeping optimal deepSDF training distribution intact
+        sample_idx_pos = torch.randint(0, N_pos, (B_pos, pos_num_samples), device=self.device)
+        sample_idx_neg = torch.randint(0, N_neg, (B_neg, neg_num_samples), device=self.device)
+        sample_idx_pos_out = torch.randint(0, N_pos_out, (B_pos_out, pos_out_num_samples), device=self.device)
+        sample_idx_neg_out = torch.randint(0, N_neg_out, (B_neg_out, neg_out_num_samples), device=self.device)
+
+        points_pos = torch.gather(points_pos, 1, sample_idx_pos.unsqueeze(-1).expand(-1, -1, D_pos))
+        points_neg = torch.gather(points_neg, 1, sample_idx_neg.unsqueeze(-1).expand(-1, -1, D_neg))
+        points_pos_outlier = torch.gather(points_pos_outlier, 1, sample_idx_pos_out.unsqueeze(-1).expand(-1, -1, D_pos_out))
+        points_neg_outlier = torch.gather(points_neg_outlier, 1, sample_idx_neg_out.unsqueeze(-1).expand(-1, -1, D_neg_out))
+
+        sdf_pos = torch.gather(sdf_pos, 1, sample_idx_pos.unsqueeze(-1))
+        sdf_neg = torch.gather(sdf_neg, 1, sample_idx_neg.unsqueeze(-1))
+        sdf_pos_outlier = torch.gather(sdf_pos_outlier, 1, sample_idx_pos_out.unsqueeze(-1))
+        sdf_neg_outlier = torch.gather(sdf_neg_outlier, 1, sample_idx_neg_out.unsqueeze(-1))
+
+        points = torch.cat([points_pos, points_neg, points_pos_outlier, points_neg_outlier], dim=1)
+        sdf = torch.cat([sdf_pos, sdf_neg, sdf_pos_outlier, sdf_neg_outlier], dim=1)
+        B, N_actual, D = points.shape
+
         z_shape = self.latents(shape_ids)  # (B, latent_dim)
+        z_expanded = z_shape.repeat_interleave(N_actual, dim=0)
+        x_flat = points.reshape(B * N_actual, D)
+        s_flat = sdf.reshape(B * N_actual, 1)
 
-        # --- Latent regularization ---
+        # Latent regularization
         latent_reg = sigma * (z_shape ** 2).sum() if self.regularize_latent else torch.tensor(0.0, device=self.device)
+        #forward pass 
+        pred = self.model(x_flat, z_expanded)
+        #compute loss
+        if self.clamp_delta is not None:
+            data_loss = clamped_l1_loss(pred, s_flat, self.clamp_delta).sum()
+        else:
+            data_loss = l1_loss(pred, s_flat).sum()
 
-        # --- Expand latent to per-point ---
-        z = z_shape[:, None, :].expand(B, N, -1).reshape(-1, z_shape.shape[1])
-        x = points.reshape(-1, D)
-        s = sdf.reshape(-1, 1)
+        total_loss = data_loss + latent_reg
 
-        # --- Data term ---
-        pred = self.model(x, z)
-        data_loss = clamped_l1_loss(pred, s, self.clamp_delta).sum() if self.clamp_delta is not None else l1_loss(pred, s).sum()
 
-        # --- Total loss ---
-        loss = data_loss + latent_reg
-
+        # Backpropagation
         self.optimizer.zero_grad()
-        loss.backward()
+        total_loss.backward()
         self.optimizer.step()
 
-        return loss.item(), data_loss.item(), latent_reg.item()
+        return total_loss.item(), data_loss.item(), latent_reg.item()
+
+        """
+        Fast subsampling strategy but breaks training distribution and leads to worse results. Keeping for reference.
+
+        # ----------------------
+        # Random subsampling
+        # ----------------------
+        num_samples = min(5000, N)
+        sample_idx = torch.randint(0, N, (B, num_samples), device=self.device)
+
+        points = torch.gather(points, 1, sample_idx.unsqueeze(-1).expand(-1, -1, D))
+        sdf = torch.gather(sdf, 1, sample_idx.unsqueeze(-1))
+
+        # Updated shape after subsampling
+        B, N_actual, D = points.shape
+
+        # ----------------------
+        # Latent per shape
+        # ----------------------
+        z_shape = self.latents(shape_ids)  # (B, latent_dim)
+        z_expanded = z_shape.repeat_interleave(N_actual, dim=0)
+
+        # ----------------------
+        # Flatten points and sdf for MLP
+        # ----------------------
+        x_flat = points.reshape(B * N_actual, D)
+        s_flat = sdf.reshape(B * N_actual, 1)
+
+        # ----------------------
+        # Latent regularization
+        # ----------------------
+        latent_reg = sigma * (z_shape ** 2).sum() if self.regularize_latent else torch.tensor(0.0, device=self.device)
+
+        # ----------------------
+        # Forward pass
+        # ----------------------
+        pred = self.model(x_flat, z_expanded)
+
+        # ----------------------
+        # Compute loss
+        # ----------------------
+        if self.clamp_delta is not None:
+            data_loss = clamped_l1_loss(pred, s_flat, self.clamp_delta).sum()
+        else:
+            data_loss = l1_loss(pred, s_flat).sum()
+
+        total_loss = data_loss + latent_reg
+
+        # ----------------------
+        # Backprop
+        # ----------------------
+        self.optimizer.zero_grad()
+        total_loss.backward()
+        self.optimizer.step()
+
+        return total_loss.item(), data_loss.item(), latent_reg.item()
+        """
 
     def save_snapshot(self, epoch: int):
         """Save model, latents, and optimizer states for a given epoch."""
@@ -169,12 +308,60 @@ class DeepSDFTrainer:
 
     def train(self, dataloader, epochs, snapshot_every=100):
         """Full training loop with logging and loss tracking."""
+
+        #pull out outliers first its an outlier if abs(sdf) >self.clamp delta
+        preprocessed = []
+
+        for sid, pts, sdf in dataloader:
+
+            pts = pts.to(self.device)
+            sdf = sdf.to(self.device)
+
+            sdf_flat = sdf[..., 0]
+
+            near_mask = torch.abs(sdf_flat) <= self.clamp_delta
+            far_mask  = torch.abs(sdf_flat) > self.clamp_delta
+
+            pos_mask = sdf_flat > 0
+            neg_mask = sdf_flat < 0
+
+            pos_near = pos_mask & near_mask
+            neg_near = neg_mask & near_mask
+            pos_far  = pos_mask & far_mask
+            neg_far  = neg_mask & far_mask
+            sid=sid.to(self.device)
+
+            preprocessed.append(
+                (
+                    sid,
+                    pts[:, pos_near[0]],
+                    pts[:, neg_near[0]],
+                    pts[:, pos_far[0]],
+                    pts[:, neg_far[0]],
+                    sdf[:, pos_near[0]],
+                    sdf[:, neg_near[0]],
+                    sdf[:, pos_far[0]],
+                    sdf[:, neg_far[0]],
+                )
+            )
+  
         for epoch in range(1, epochs + 1):
             sigma = self.sigma0 * min(1.0, 1.0 / epoch)
             epoch_total, epoch_data, epoch_latent = 0.0, 0.0, 0.0
 
-            for sid, pts, sdf in dataloader:
-                loss, data_loss, latent_reg = self.train_step(sid, pts, sdf, sigma)
+            for sid, pos_pts, neg_pts, pos_out_pts, neg_out_pts, sdf_pos, sdf_neg, sdf_pos_out, sdf_neg_out in preprocessed:
+                loss, data_loss, latent_reg = self.train_step(
+                    sid,
+                    points_pos=pos_pts,
+                    points_neg=neg_pts,
+                    points_pos_outlier=pos_out_pts,
+                    points_neg_outlier=neg_out_pts,
+                    sdf_pos=sdf_pos,
+                    sdf_neg=sdf_neg,
+                    sdf_pos_outlier=sdf_pos_out,
+                    sdf_neg_outlier=sdf_neg_out,
+                    sigma=sigma)
+                
                 epoch_total += loss
                 epoch_data += data_loss
                 epoch_latent += latent_reg

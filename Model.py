@@ -32,7 +32,7 @@ def estimate_center(
 
     mask = torch.abs(sdf_vals) < surface_thresh
     if mask.sum() < 128:
-        return fallback_center.clone()
+        return fallback_center.clone().to(device)
 
     near_pts = pts[mask]
     near_sdf = sdf_vals[mask]
@@ -41,7 +41,6 @@ def estimate_center(
     projected = near_pts - near_sdf.unsqueeze(1) * dirs
 
     return projected.median(dim=0).values
-
 
 
 
@@ -82,30 +81,32 @@ class Model:
         domain_radius: float = 1.0,
         latent_dim: int = 256,
         num_epochs: int = 500,
-        scenes_per_batch: int = 1,
-        device: str = "cpu",
+        scenes_per_batch: int = 16,
         training_clamp_dist: float|None = 0.1,
         sample_clamp_dist: float = 0.1,
-        samples_per_scene: int = 5000,
+        samples_per_scene: int = 50000,
         regularize_latent: bool = False,
-        latent_injection_layer: int | None = 4,
+        skip_layer: int | None = 4,
         soft_latent: bool = True,
+        weight_norm: bool = False,
     ):
         self.base_directory = base_directory
         self.regularize_latent = regularize_latent
         self.soft_latent = soft_latent
-    
+        self.weight_norm = weight_norm
+
         self.model_name = model_name
         self.scenes = scenes
         self.domain_radius = domain_radius
         self.latent_dim = latent_dim
         self.num_epochs = num_epochs
         self.scenes_per_batch = scenes_per_batch
-        self.device = device
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
         self.training_clamp_dist = training_clamp_dist
         self.sample_clamp_dist = sample_clamp_dist
         self.samples_per_scene = samples_per_scene
-        self.latent_injection_layer = latent_injection_layer
+        self.skip_layer = skip_layer
 
         self.trained_scenes: Dict[str, Scene] = {}
 
@@ -120,13 +121,13 @@ class Model:
         model_name: str,
         latent_injection_layer: int | None = None,
         soft_latent: bool = True,
-        device: str = "cpu",
+        weight_norm: bool = False,
     ):
         """
         Load a trained DeepSDF Model from a snapshot .pth file for inference.
         Fully reconstructs the decoder to match checkpoint shapes exactly.
         """
-        device = torch.device(device)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         ckpt = torch.load(snapshot_path, map_location=device)
         state_dict = ckpt["model_state_dict"]
 
@@ -165,8 +166,9 @@ class Model:
             latent_dim=latent_dim,
             hidden_dim=hidden_dim,
             num_layers=num_layers,
-            latent_injection_layer=latent_injection_layer,
+            skip_layer=latent_injection_layer,
             soft_latent=soft_latent,
+            weight_norm= weight_norm,
         ).to(device)
 
         decoder.load_state_dict(state_dict)
@@ -180,9 +182,9 @@ class Model:
             model_name=model_name,
             scenes={},  # inference-only
             latent_dim=latent_dim,
-            latent_injection_layer=latent_injection_layer,
+            skip_layer=latent_injection_layer,
             soft_latent=soft_latent,
-            device=str(device),
+        
             num_epochs=0,
         )
         model_obj.model = decoder
@@ -218,11 +220,11 @@ class Model:
         self,
         scene: SceneWithOperators,
         samples_per_scene: int,
-        clamp_dist: float = 0.1,
+        clamp_dist: float,
         outlier_pct: float = 0.05,
     ):
         """
-        Robust DeepSDF-compatible sampling:
+        Samples a scene by querying its SDF operators.
         - 50/50 positive / negative SDF
         - shell + volume sampling
         - bounded outliers
@@ -233,10 +235,7 @@ class Model:
             sdf : (N, 1)
         """
 
-        device = torch.device("cpu")
-
-        
-
+        device = self.device
         # ---------------------------------------------------------
         # Scene center estimation
         # ---------------------------------------------------------
@@ -272,8 +271,8 @@ class Model:
             n_params = len(param_ranges)
 
             if n_params > 0:
-                low = torch.tensor([a for a, _ in param_ranges], device=device)
-                high = torch.tensor([b for _, b in param_ranges], device=device)
+                low = torch.tensor([a for a, _ in param_ranges], device=device, dtype=torch.float32)
+                high = torch.tensor([b for _, b in param_ranges], device=device, dtype=torch.float32)
             else:
                 low = high = None
 
@@ -403,8 +402,12 @@ class Model:
             dataset,
             batch_size=self.scenes_per_batch,
             shuffle=True,
-            drop_last=True,
+            drop_last=False,
+            num_workers=8,
+            pin_memory=True,
+            persistent_workers=True,
         )
+        
 
         # Geometry dimension = xyz + operator params
         example_pts, _ = next(iter(scene_samples.values()))
@@ -417,9 +420,10 @@ class Model:
             latent_dim=self.latent_dim,
             hidden_dim=512,
             num_layers=8,
-            latent_injection_layer=self.latent_injection_layer,
+            skip_layer=self.skip_layer,
             soft_latent=self.soft_latent,
-        )
+            weight_norm= self.weight_norm,
+        ).to(self.device)
 
         trainer = DeepSDFTrainer(
             model=model,
@@ -427,8 +431,7 @@ class Model:
             num_shapes=len(self.scenes),
             latent_dim=self.latent_dim,
             clamp_delta= self.training_clamp_dist,
-            device=self.device,
-            regularize_latent=self.regularize_latent,
+            regularize_latent=self.regularize_latent
         )
 
         print(f"[INFO] Training for {self.num_epochs} epochs")
@@ -436,7 +439,7 @@ class Model:
         trainer.train(
             dataloader=loader,
             epochs=self.num_epochs,
-            snapshot_every=500 # saves every 100 epochs
+            snapshot_every=1000 # saves every 100 epochs
         )
 
         self.model = model
@@ -461,26 +464,37 @@ class Model:
         latent_vector: torch.Tensor,
         xyz: torch.Tensor,
         params: Optional[torch.Tensor] = None,
-        chunk: int = 50_000,
+        chunk: int = 50000,
     ):
         self.model.eval()
 
+        device = self.device
+
+        latent_vector = latent_vector.to(device)
+
         if latent_vector.dim() == 1:
             latent_vector = latent_vector.unsqueeze(0)
+
+        xyz = xyz.to(device)
+
+        if params is not None:
+            params = params.to(device)
 
         outputs = []
 
         with torch.no_grad():
             for i in range(0, xyz.shape[0], chunk):
-                pts = xyz[i : i + chunk]
+
+                pts = xyz[i:i+chunk]
 
                 if params is not None:
-                    pts = torch.cat(
-                        [pts, params.expand(pts.size(0), -1)], dim=1
-                    )
+                    p = params.expand(pts.size(0), -1)
+                    pts = torch.cat([pts, p], dim=1)
 
-                z = latent_vector.expand(pts.size(0), -1).to(pts.device)
+                z = latent_vector.expand(pts.size(0), -1)
+
                 sdf = self.model(pts, z)
+
                 outputs.append(sdf.squeeze(1))
 
         return torch.cat(outputs, dim=0)
@@ -495,14 +509,16 @@ class Model:
         clamp_dist=0.1,
         param_values=None,
     ):
+        
+        decoder = self.model
+        device = next(decoder.parameters()).device
+
         if param_values is None:
             param_values = [None]
 
         meshes = []
+        latent_vector = latent.view(1, -1).float().to(device)
 
-        latent_vector = latent.view(1, -1).float()
-        decoder = self.model
-        device = next(decoder.parameters()).device
 
         example_scene = next(iter(self.scenes.values()))
         _, param_ranges = next(iter(example_scene.values()))
@@ -519,9 +535,9 @@ class Model:
 
             param_tensor = None
             if param_case is not None:
-                param_tensor = torch.tensor(param_case).view(1, -1)
+                param_tensor = torch.tensor(param_case, dtype=torch.float32, device=device).view(1, -1)
                 pts = torch.cat([pts, param_tensor.repeat(len(pts), 1)], dim=1)
-
+            
             sdf = self.compute_sdf_from_latent(
                 latent_vector=latent_vector,
                 xyz=pts,
@@ -577,14 +593,19 @@ class Model:
         # Center estimation
         # ------------------------------------------------------------
         pts = (torch.rand(probe_N, 3, device=device) * 2 - 1) * init_range
+        pts = pts.to(device)
         sdf_vals = self.compute_sdf_from_latent(latent_vector, pts).view(-1)
+        sdf_vals = sdf_vals.to(device)
 
         near_mask = torch.abs(sdf_vals) < surface_thresh
+        sdf_vals = sdf_vals.to(device)
         if near_mask.sum() < 128:
             center = fallback_center.clone()
         else:
             near_pts = pts[near_mask]
+            near_pts = near_pts.to(device)
             near_sdf = sdf_vals[near_mask]
+            near_sdf = near_sdf.to(device)
 
             dirs = near_pts / (near_pts.norm(dim=1, keepdim=True) + 1e-12)
             projected = near_pts - near_sdf.unsqueeze(1) * dirs
@@ -597,6 +618,7 @@ class Model:
         probes = center.unsqueeze(0) + dirs * (init_range * 0.95)
 
         sd = self.compute_sdf_from_latent(latent_vector, probes)
+        sd=sd.to(device)
         radii = (probes - center).norm(dim=1) - sd
 
         radius = torch.median(radii).clamp(min=1e-3).item()
@@ -615,7 +637,8 @@ class Model:
         z = np.linspace(lo[2], hi[2], grid_res)
 
         grid = np.stack(np.meshgrid(x, y, z, indexing="ij"), axis=-1)
-        pts_flat = torch.from_numpy(grid.reshape(-1, 3)).float()
+        pts_flat = torch.from_numpy(grid.reshape(-1, 3)).float().to(device)
+
 
         return pts_flat, x, y, z
 
@@ -633,25 +656,31 @@ class Scene:
         self.scene_key = scene_key
         self.latent_vector = latent_vector
 
-        raw_id = "_".join(scene_key.split("_")[1:])
+        raw_id = scene_key
+
+        if raw_id not in self.parent_model.scenes:
+            raw_id = scene_key.split(self.parent_model.model_name.lower() + "_")[-1]
+
         self.sdf_ops = self.parent_model.scenes.get(raw_id)
 
         if self.sdf_ops is None:
             raise KeyError(f"Scene '{raw_id}' not found")
 
+
     def compute_trained_sdf(
         self,
         xyz: torch.Tensor,
         params: Optional[torch.Tensor] = None,
-        chunk: int = 50_000,
+        chunk: int = 50000,
     ):
+        
         return self.parent_model.compute_sdf_from_latent(
-            latent_vector=self.latent_vector,
+            latent_vector=self.latent_vector.to(self.parent_model.device),
             xyz=xyz,
             params=params,
             chunk=chunk,
         )
-
+    
     def get_latent_vector(self):
         return self.latent_vector
 

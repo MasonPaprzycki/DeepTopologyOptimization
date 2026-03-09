@@ -63,7 +63,7 @@ model = Model.Model(
     regularize_latent=True,
     training_clamp_dist=0.1,
     samples_per_scene=10000,
-    device="cpu",  # Force CPU to avoid CUDA errors
+    # Force CPU to avoid CUDA errors
 )
 
 print("[INFO] Model initialized. Starting training...")
