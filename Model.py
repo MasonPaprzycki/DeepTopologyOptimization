@@ -502,61 +502,7 @@ class Model:
     def get_scene(self, scene_key: str):
         return self.trained_scenes[scene_key]
     
-    def visualize_a_shape(
-        self,
-        latent: torch.Tensor,
-        grid_res=160,
-        clamp_dist=0.1,
-        param_values=None,
-    ):
-        
-        decoder = self.model
-        device = next(decoder.parameters()).device
-
-        if param_values is None:
-            param_values = [None]
-
-        meshes = []
-        latent_vector = latent.view(1, -1).float().to(device)
-
-
-        example_scene = next(iter(self.scenes.values()))
-        _, param_ranges = next(iter(example_scene.values()))
-        num_params = len(param_ranges)
-
-        xyz_points, x, y, z = self.build_dynamic_sampling_grid(
-            latent_vector=latent_vector,
-            grid_res=grid_res,
-            device=device,
-        )
-
-        for idx, param_case in enumerate(param_values):
-            pts = xyz_points.clone()
-
-            param_tensor = None
-            if param_case is not None:
-                param_tensor = torch.tensor(param_case, dtype=torch.float32, device=device).view(1, -1)
-                pts = torch.cat([pts, param_tensor.repeat(len(pts), 1)], dim=1)
-            
-            sdf = self.compute_sdf_from_latent(
-                latent_vector=latent_vector,
-                xyz=pts,
-                params=param_tensor,
-            ).cpu().numpy()
-
-            volume = np.clip(sdf.reshape(grid_res, grid_res, grid_res), -clamp_dist, clamp_dist)
-            print("SDF min:", sdf.min(), "max:", sdf.max())
-            if not (volume.min() < 0 < volume.max()):
-                continue
-
-            verts, faces, normals, _ = measure.marching_cubes(volume, level=0.0)
-            scale = x[1] - x[0]
-            verts = verts * scale + np.array([x[0], y[0], z[0]])
-
-            mesh = trimesh.Trimesh(verts, faces, vertex_normals=normals)
-            meshes.append(mesh)
-
-        return meshes
+    
     
     def build_dynamic_sampling_grid(
         self,
@@ -642,8 +588,52 @@ class Model:
 
         return pts_flat, x, y, z
 
+    ############################################################
+    # SDF → voxel occupancy
+    ############################################################
+
+    def sdf_voxel(self, latent,grid_pts,GRID_RES):
+
+        with torch.no_grad():
+
+            sdf = self.compute_sdf_from_latent(
+                latent,
+                grid_pts,
+                chunk=50000
+            )
+
+        occ = (sdf < 0).cpu().numpy()
+
+        return occ.reshape(GRID_RES, GRID_RES, GRID_RES)
 
 
+    ############################################################
+    # SDF → mesh reconstruction
+    ############################################################
+
+    def reconstruct_mesh(self, latent, name, grid_pts,GRID_RES):
+
+        with torch.no_grad():
+
+            sdf = self.compute_sdf_from_latent(
+                latent,
+                grid_pts,
+                chunk=50000
+            )
+
+        sdf = sdf.cpu().numpy().reshape(GRID_RES,GRID_RES,GRID_RES)
+
+        verts, faces, _, _ = measure.marching_cubes(
+            sdf,
+            level=0.0,
+            spacing=(2/(GRID_RES-1), 2/(GRID_RES-1), 2/(GRID_RES-1))
+        )
+
+        verts -= 1.0
+
+        mesh = trimesh.Trimesh(verts, faces)
+
+        return mesh
 
 class Scene:
     def __init__(
