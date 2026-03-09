@@ -27,7 +27,7 @@ def l1_loss(pred, target):
 class DeepSDF(nn.Module):
     """DeepSDF MLP with latent injection at input and optionally at mid-network."""
     def __init__(self, input_dim, latent_dim=256, hidden_dim=512,
-                num_layers=8, skip_layer=None, soft_latent=True,weight_norm=False):
+                num_layers=8, skip_layer=None, soft_latent=False,weight_norm=False):
         super().__init__()
 
         self.skip_layer = skip_layer
@@ -100,7 +100,7 @@ class SDFDataset(Dataset):
 class DeepSDFTrainer:
     """Trainer for DeepSDF auto-decoder."""
     def __init__(self, base_directory, model, num_shapes, latent_dim=256, sigma0=1e-4,
-                 lr_net=5e-4, lr_latent=1e-3, clamp_delta=0.1,regularize_latent: bool = True, weight_norm: bool = False, subsample_clamp_dist=0.1, device=None):
+                 lr_net=5e-4, lr_latent=1e-3, clamp_delta:float|None=0.1,regularize_latent: bool = True, weight_norm: bool = False, subsample_clamp_dist=0.1, device=None):
         
         self.base_directory = base_directory
         self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -318,9 +318,13 @@ class DeepSDFTrainer:
             sdf = sdf.to(self.device)
 
             sdf_flat = sdf[..., 0]
-
-            near_mask = torch.abs(sdf_flat) <= self.clamp_delta
-            far_mask  = torch.abs(sdf_flat) > self.clamp_delta
+            if self.clamp_delta != None:
+                near_mask = torch.abs(sdf_flat) <= self.clamp_delta
+                far_mask  = torch.abs(sdf_flat) > self.clamp_delta
+            
+            else: 
+                near_mask = sdf_flat
+                far_mask = sdf_flat
 
             pos_mask = sdf_flat > 0
             neg_mask = sdf_flat < 0
@@ -396,32 +400,3 @@ class DeepSDFTrainer:
         plt.savefig(save_path, dpi=200)
         plt.close()
         print(f"[INFO] Loss curve saved → {save_path}")
-
-
-def infer_latent(model: DeepSDF, points: torch.Tensor, sdf: torch.Tensor,
-                 latent_dim: int = 256, latent_sigma: float = 0.01,
-                 lr: float = 1e-3, iters: int = 800, clamp_delta: float = 0.1,
-                 device: str = "cpu"):
-    """Optimize a latent vector for a new shape with a fixed network."""
-    model.eval()
-    points = points.to(device)
-    sdf = sdf.to(device)
-
-    z = torch.zeros((1, latent_dim), device=device, requires_grad=True)
-    nn.init.normal_(z, mean=0.0, std=latent_sigma)
-
-    optimizer = optim.Adam([z], lr=lr)
-
-    for _ in range(iters):
-        z_rep = z.expand(points.shape[0], -1)
-        pred = model(points, z_rep)
-
-        data_loss = clamped_l1_loss(pred, sdf, clamp_delta).mean() if clamp_delta is not None else l1_loss(pred, sdf).mean()
-        latent_reg = (z ** 2).sum() / (latent_sigma ** 2)
-        loss = data_loss + latent_reg
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-    return z.detach()
