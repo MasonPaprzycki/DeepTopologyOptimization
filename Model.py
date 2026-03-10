@@ -474,18 +474,26 @@ class Model:
         return pts, sdf
 
 
-    def train(self):
+    def train(self, grid= None,stochastic =False):
         print("[INFO] Sampling scenes")
 
         scene_samples: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
-        for idx, (scene_id, scene) in enumerate(self.scenes.items()):
-            print(f"[SAMPLE] Scene '{scene_id}'")
-            pts, sdf = self._sample_scene(
-                scene,
-                self.samples_per_scene,
-                clamp_dist=self.sample_clamp_dist,
-            )
-            scene_samples[idx] = (pts, sdf)
+        if grid == None: 
+            for idx, (scene_id, scene) in enumerate(self.scenes.items()):
+                print(f"[SAMPLE] Scene '{scene_id}'")
+                pts, sdf = self._sample_scene(
+                    scene,
+                    self.samples_per_scene,
+                    clamp_dist=self.sample_clamp_dist,
+                )
+                scene_samples[idx] = (pts, sdf)
+        else:
+            for idx, (scene_id, scene) in enumerate(self.scenes.items()):
+                print(f"[SAMPLE] Scene '{scene_id}'")
+                
+                pts, sdf = self._sample_scene_over_grid(scene = scene, grid_pts=grid)
+    
+                scene_samples[idx] = (pts, sdf)
 
         dataset = SceneSDFDataset(scene_samples)
         loader = DataLoader(
@@ -495,7 +503,6 @@ class Model:
             drop_last=False,
             num_workers=8,
             pin_memory=True,
-            persistent_workers=True,
         )
         
 
@@ -529,7 +536,8 @@ class Model:
         trainer.train(
             dataloader=loader,
             epochs=self.num_epochs,
-            snapshot_every=1000 # saves every 100 epochs
+            snapshot_every=1000,
+            stochastic_distribution=stochastic
         )
 
         self.model = model

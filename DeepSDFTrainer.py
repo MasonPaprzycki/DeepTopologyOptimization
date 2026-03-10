@@ -148,17 +148,7 @@ class DeepSDFTrainer:
             loss, data_loss, latent_reg
         """
         # Move to device
-        points_pos = points_pos.to(self.device)
-        points_neg = points_neg.to(self.device)
-        points_pos_outlier = points_pos_outlier.to(self.device)
-        points_neg_outlier = points_neg_outlier.to(self.device)
-
-        #points = points.to(self.device)
-   
-        sdf_pos= sdf_pos.to(self.device)
-        sdf_neg= sdf_neg.to(self.device)
-        sdf_pos_outlier =sdf_pos_outlier.to(self.device)
-        sdf_neg_outlier = sdf_neg_outlier.to(self.device)
+ 
 
         shape_ids = shape_ids.to(self.device)
       
@@ -223,16 +213,17 @@ class DeepSDFTrainer:
         z_shape = self.latents(shape_ids)  # (B, latent_dim)
         z_expanded = z_shape.repeat_interleave(N_actual, dim=0)
 
-        z = z_shape[:, None, :].expand(-1, N_actual, -1)   # (B, N, latent)
-        h = torch.cat([points, z], dim=-1)                 # (B, N, D+latent)
-        h = h.reshape(B * N_actual, -1)
+
+        points_flat = points.reshape(B * N_actual, D)
+
+        #forward pass 
+        pred = self.model(points_flat, z_expanded)
 
         s_flat = sdf.reshape(B * N_actual, 1)
 
         # Latent regularization
         latent_reg = sigma * (z_shape ** 2).sum() if self.regularize_latent else torch.tensor(0.0, device=self.device)
-        #forward pass 
-        pred = self.model(h, z_expanded)
+       
         #compute loss
         if self.clamp_delta is not None:
             data_loss = clamped_l1_loss(pred, s_flat, self.clamp_delta).sum()
@@ -256,7 +247,7 @@ class DeepSDFTrainer:
         # Random subsampling
         # ----------------------
         points = points.to(self.device)
-        B, N, D = points.shape[1]
+        B, N, D = points.shape
 
         num_samples = min(5000, N)
         sample_idx = torch.randint(0, N, (B, num_samples), device=self.device)
@@ -273,9 +264,9 @@ class DeepSDFTrainer:
         z_shape = self.latents(shape_ids)  # (B, latent_dim)
         z_expanded = z_shape.repeat_interleave(N_actual, dim=0)
 
-        z = z_shape[:, None, :].expand(-1, N_actual, -1)   # (B, N, latent)
-        h = torch.cat([points, z], dim=-1)                 # (B, N, D+latent)
-        h = h.reshape(B * N_actual, -1)
+        points_flat = points.reshape(B * N_actual, D)
+        #forward pass 
+        pred = self.model(points_flat, z_expanded)
         s_flat = sdf.reshape(B * N_actual, 1)
 
         # ----------------------
@@ -283,10 +274,8 @@ class DeepSDFTrainer:
         # ----------------------
         latent_reg = sigma * (z_shape ** 2).sum() if self.regularize_latent else torch.tensor(0.0, device=self.device)
 
-        # ----------------------
-        # Forward pass
-        # ----------------------
-        pred = self.model(h, z_expanded)
+       
+   
 
         # ----------------------
         # Compute loss
@@ -326,8 +315,50 @@ class DeepSDFTrainer:
     def train(self, dataloader, epochs, snapshot_every=100, stochastic_distribution=False):
         """Full training loop with logging and loss tracking."""
 
-        #pull out outliers first its an outlier if abs(sdf) >self.clamp delta
-    
+        #stochastic training path
+        if stochastic_distribution:
+
+            for epoch in range(1, epochs + 1):
+
+                sigma = self.sigma0 * min(1.0, 1.0 / epoch)
+                epoch_total, epoch_data, epoch_latent = 0.0, 0.0, 0.0
+                num_batches = 0
+
+                for sid, pts, sdf in dataloader:
+
+                    pts = pts.to(self.device)
+                    sdf = sdf.to(self.device)
+                    sid = sid.to(self.device)
+
+                    loss, data_loss, latent_reg = self.train_step_stochastic_distribution(
+                        shape_ids=sid,
+                        points=pts,
+                        sdf=sdf,
+                        sigma=sigma
+                    )
+
+                    epoch_total += loss
+                    epoch_data += data_loss
+                    epoch_latent += latent_reg
+                    num_batches += 1
+
+                self.loss_history["total"].append(epoch_total / num_batches)
+                self.loss_history["data"].append(epoch_data / num_batches)
+                self.loss_history["latent_reg"].append(epoch_latent / num_batches)
+
+                print(
+                    f"[{epoch:04d}] total_loss={epoch_total:.6e} "
+                    f"data_loss={epoch_data:.6e} latent_reg={epoch_latent:.6e}"
+                )
+
+                if epoch % snapshot_every == 0:
+                    self.save_snapshot(epoch)
+
+            self.plot_losses()
+            return
+
+     
+        # PREPROCESS DATASET (NON-STOCHASTIC TRAINING)
         preprocessed = []
 
         for sid, pts, sdf in dataloader:
@@ -336,43 +367,15 @@ class DeepSDFTrainer:
             sdf = sdf.to(self.device)
             sid = sid.to(self.device)
 
-            if stochastic_distribution==True:
-
-                for epoch in range (1, epochs +1):
-
-                    sigma = self.sigma0 * min(1.0, 1.0 / epoch)
-                    epoch_total, epoch_data, epoch_latent = 0.0, 0.0, 0.0
-               
-                    loss,data_loss,latent_reg = self.train_step_stochastic_distribution(
-                        shape_ids=sid, points=pts, sdf= sdf, sigma=sigma
-                    )
-
-                    epoch_total += loss
-                    epoch_data += data_loss
-                    epoch_latent += latent_reg
-
-                    self.loss_history["total"].append(epoch_total / len(preprocessed))
-                    self.loss_history["data"].append(epoch_data / len(preprocessed))
-                    self.loss_history["latent_reg"].append(epoch_latent / len(preprocessed))
-                    print(f"[{epoch:04d}] total_loss={epoch_total:.6e} "
-                        f"data_loss={epoch_data:.6e} latent_reg={epoch_latent:.6e}")
-
-                    if epoch % snapshot_every == 0:
-                        self.save_snapshot(epoch)
-                
-                self.plot_losses()
-
-                return
-            
             B, N, D = pts.shape
 
             for b in range(B):
 
-                pts_b = pts[b]          # (N, D)
-                sdf_b = sdf[b]          # (N, 1)
-                sid_b = sid[b:b+1]      # keep batch dim -> (1,)
+                pts_b = pts[b]
+                sdf_b = sdf[b]
+                sid_b = sid[b:b+1]
 
-                sdf_flat = sdf_b[:, 0]  # (N,)
+                sdf_flat = sdf_b[:, 0]
 
                 pos_mask = sdf_flat > 0
                 neg_mask = sdf_flat < 0
@@ -389,7 +392,6 @@ class DeepSDFTrainer:
                 pos_far  = pos_mask & far_mask
                 neg_far  = neg_mask & far_mask
 
-                # safe slicing (handles empty tensors correctly)
                 pts_pos_near = pts_b[pos_near]
                 pts_neg_near = pts_b[neg_near]
                 pts_pos_far  = pts_b[pos_far]
@@ -400,7 +402,6 @@ class DeepSDFTrainer:
                 sdf_pos_far  = sdf_b[pos_far]
                 sdf_neg_far  = sdf_b[neg_far]
 
-                # restore batch dimension
                 preprocessed.append(
                     (
                         sid_b,
@@ -414,12 +415,26 @@ class DeepSDFTrainer:
                         sdf_neg_far.unsqueeze(0),
                     )
                 )
-        
+
+
+        # TRAINING LOOP
         for epoch in range(1, epochs + 1):
+
             sigma = self.sigma0 * min(1.0, 1.0 / epoch)
             epoch_total, epoch_data, epoch_latent = 0.0, 0.0, 0.0
 
-            for sid, pos_pts, neg_pts, pos_out_pts, neg_out_pts, sdf_pos, sdf_neg, sdf_pos_out, sdf_neg_out in preprocessed:
+            for (
+                sid,
+                pos_pts,
+                neg_pts,
+                pos_out_pts,
+                neg_out_pts,
+                sdf_pos,
+                sdf_neg,
+                sdf_pos_out,
+                sdf_neg_out,
+            ) in preprocessed:
+
                 loss, data_loss, latent_reg = self.train_step(
                     sid,
                     points_pos=pos_pts,
@@ -430,23 +445,28 @@ class DeepSDFTrainer:
                     sdf_neg=sdf_neg,
                     sdf_pos_outlier=sdf_pos_out,
                     sdf_neg_outlier=sdf_neg_out,
-                    sigma=sigma)
-                
+                    sigma=sigma,
+                )
+
                 epoch_total += loss
                 epoch_data += data_loss
                 epoch_latent += latent_reg
-            
-            self.loss_history["total"].append(epoch_total / len(preprocessed))
-            self.loss_history["data"].append(epoch_data / len(preprocessed))
-            self.loss_history["latent_reg"].append(epoch_latent / len(preprocessed))
-            print(f"[{epoch:04d}] total_loss={epoch_total:.6e} "
-                f"data_loss={epoch_data:.6e} latent_reg={epoch_latent:.6e}")
+
+            n = len(preprocessed)
+
+            self.loss_history["total"].append(epoch_total / n)
+            self.loss_history["data"].append(epoch_data / n)
+            self.loss_history["latent_reg"].append(epoch_latent / n)
+
+            print(
+                f"[{epoch:04d}] total_loss={epoch_total:.6e} "
+                f"data_loss={epoch_data:.6e} latent_reg={epoch_latent:.6e}"
+            )
 
             if epoch % snapshot_every == 0:
                 self.save_snapshot(epoch)
-               
-        self.plot_losses()
 
+        self.plot_losses()
     def train_via_grid_step_gradient_descent(
         self,
         learning_rate,
