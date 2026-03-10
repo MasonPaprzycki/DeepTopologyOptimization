@@ -195,21 +195,38 @@ class DeepSDFTrainer:
         #Random subsampling keeping optimal deepSDF training distribution intact
         sample_idx_pos = torch.randint(0, N_pos, (B_pos, pos_num_samples), device=self.device)
         sample_idx_neg = torch.randint(0, N_neg, (B_neg, neg_num_samples), device=self.device)
-        sample_idx_pos_out = torch.randint(0, N_pos_out, (B_pos_out, pos_out_num_samples), device=self.device)
-        sample_idx_neg_out = torch.randint(0, N_neg_out, (B_neg_out, neg_out_num_samples), device=self.device)
+        if pos_out_num_samples>0:
+            sample_idx_pos_out = torch.randint(0, N_pos_out, (B_pos_out, pos_out_num_samples), device=self.device)
+        else:
+            sample_idx_pos_out=None
+
+        if neg_out_num_samples > 0: 
+            sample_idx_neg_out = torch.randint(0, N_neg_out, (B_neg_out, neg_out_num_samples), device=self.device)
+        else:
+            sample_idx_neg_out=None
 
         points_pos = torch.gather(points_pos, 1, sample_idx_pos.unsqueeze(-1).expand(-1, -1, D_pos))
         points_neg = torch.gather(points_neg, 1, sample_idx_neg.unsqueeze(-1).expand(-1, -1, D_neg))
-        points_pos_outlier = torch.gather(points_pos_outlier, 1, sample_idx_pos_out.unsqueeze(-1).expand(-1, -1, D_pos_out))
-        points_neg_outlier = torch.gather(points_neg_outlier, 1, sample_idx_neg_out.unsqueeze(-1).expand(-1, -1, D_neg_out))
+        points_pos_outlier = torch.gather(points_pos_outlier, 1, sample_idx_pos_out.unsqueeze(-1).expand(-1, -1, D_pos_out)) if sample_idx_pos_out is not None else None
+        points_neg_outlier = torch.gather(points_neg_outlier, 1, sample_idx_neg_out.unsqueeze(-1).expand(-1, -1, D_neg_out)) if sample_idx_neg_out is not None else None
 
         sdf_pos = torch.gather(sdf_pos, 1, sample_idx_pos.unsqueeze(-1))
         sdf_neg = torch.gather(sdf_neg, 1, sample_idx_neg.unsqueeze(-1))
-        sdf_pos_outlier = torch.gather(sdf_pos_outlier, 1, sample_idx_pos_out.unsqueeze(-1))
-        sdf_neg_outlier = torch.gather(sdf_neg_outlier, 1, sample_idx_neg_out.unsqueeze(-1))
+        sdf_pos_outlier = torch.gather(sdf_pos_outlier, 1, sample_idx_pos_out.unsqueeze(-1)) if sample_idx_pos_out is not None else None
+        sdf_neg_outlier = torch.gather(sdf_neg_outlier, 1, sample_idx_neg_out.unsqueeze(-1)) if sample_idx_neg_out is not None else None
+        points = torch.cat([points_pos, points_neg],dim=1)
+        sdf = torch.cat([sdf_pos,sdf_neg],dim=1)
+        if points_pos_outlier is not None:
+            points= torch.cat([points, points_pos_outlier],dim=1)
+        
+        if points_neg_outlier is not None:
+            points = torch.cat([points,points_neg_outlier],dim=1)
 
-        points = torch.cat([points_pos, points_neg, points_pos_outlier, points_neg_outlier], dim=1)
-        sdf = torch.cat([sdf_pos, sdf_neg, sdf_pos_outlier, sdf_neg_outlier], dim=1)
+        if sdf_pos_outlier is not None:
+            sdf = torch.cat([sdf, sdf_pos_outlier], dim=1)
+        if sdf_neg_outlier is not None: 
+            sdf = torch.cat([sdf, sdf_neg_outlier], dim=1)
+
         B, N_actual, D = points.shape
 
         z_shape = self.latents(shape_ids)  # (B, latent_dim)
@@ -316,39 +333,59 @@ class DeepSDFTrainer:
 
             pts = pts.to(self.device)
             sdf = sdf.to(self.device)
+            sid = sid.to(self.device)
 
-            sdf_flat = sdf[..., 0]
-            if self.clamp_delta != None:
-                near_mask = torch.abs(sdf_flat) <= self.clamp_delta
-                far_mask  = torch.abs(sdf_flat) > self.clamp_delta
-            
-            else: 
-                near_mask = sdf_flat
-                far_mask = sdf_flat
+            B, N, D = pts.shape
 
-            pos_mask = sdf_flat > 0
-            neg_mask = sdf_flat < 0
+            for b in range(B):
 
-            pos_near = pos_mask & near_mask
-            neg_near = neg_mask & near_mask
-            pos_far  = pos_mask & far_mask
-            neg_far  = neg_mask & far_mask
-            sid=sid.to(self.device)
+                pts_b = pts[b]          # (N, D)
+                sdf_b = sdf[b]          # (N, 1)
+                sid_b = sid[b:b+1]      # keep batch dim -> (1,)
 
-            preprocessed.append(
-                (
-                    sid,
-                    pts[:, pos_near[0]],
-                    pts[:, neg_near[0]],
-                    pts[:, pos_far[0]],
-                    pts[:, neg_far[0]],
-                    sdf[:, pos_near[0]],
-                    sdf[:, neg_near[0]],
-                    sdf[:, pos_far[0]],
-                    sdf[:, neg_far[0]],
+                sdf_flat = sdf_b[:, 0]  # (N,)
+
+                pos_mask = sdf_flat > 0
+                neg_mask = sdf_flat < 0
+
+                if self.clamp_delta is not None:
+                    near_mask = torch.abs(sdf_flat) <= self.clamp_delta
+                    far_mask  = torch.abs(sdf_flat) > self.clamp_delta
+                else:
+                    near_mask = torch.ones_like(sdf_flat, dtype=torch.bool)
+                    far_mask  = torch.zeros_like(sdf_flat, dtype=torch.bool)
+
+                pos_near = pos_mask & near_mask
+                neg_near = neg_mask & near_mask
+                pos_far  = pos_mask & far_mask
+                neg_far  = neg_mask & far_mask
+
+                # safe slicing (handles empty tensors correctly)
+                pts_pos_near = pts_b[pos_near]
+                pts_neg_near = pts_b[neg_near]
+                pts_pos_far  = pts_b[pos_far]
+                pts_neg_far  = pts_b[neg_far]
+
+                sdf_pos_near = sdf_b[pos_near]
+                sdf_neg_near = sdf_b[neg_near]
+                sdf_pos_far  = sdf_b[pos_far]
+                sdf_neg_far  = sdf_b[neg_far]
+
+                # restore batch dimension
+                preprocessed.append(
+                    (
+                        sid_b,
+                        pts_pos_near.unsqueeze(0),
+                        pts_neg_near.unsqueeze(0),
+                        pts_pos_far.unsqueeze(0),
+                        pts_neg_far.unsqueeze(0),
+                        sdf_pos_near.unsqueeze(0),
+                        sdf_neg_near.unsqueeze(0),
+                        sdf_pos_far.unsqueeze(0),
+                        sdf_neg_far.unsqueeze(0),
+                    )
                 )
-            )
-  
+        
         for epoch in range(1, epochs + 1):
             sigma = self.sigma0 * min(1.0, 1.0 / epoch)
             epoch_total, epoch_data, epoch_latent = 0.0, 0.0, 0.0
@@ -371,9 +408,9 @@ class DeepSDFTrainer:
                 epoch_latent += latent_reg
 
             # Store averaged losses for plotting
-            self.loss_history["total"].append(epoch_total / len(dataloader))
-            self.loss_history["data"].append(epoch_data / len(dataloader))
-            self.loss_history["latent_reg"].append(epoch_latent / len(dataloader))
+            self.loss_history["total"].append(epoch_total / len(preprocessed))
+            self.loss_history["data"].append(epoch_data / len(preprocessed))
+            self.loss_history["latent_reg"].append(epoch_latent / len(preprocessed))
             print(f"[{epoch:04d}] total_loss={epoch_total:.6e} "
                 f"data_loss={epoch_data:.6e} latent_reg={epoch_latent:.6e}")
 
