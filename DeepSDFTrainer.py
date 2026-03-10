@@ -228,13 +228,17 @@ class DeepSDFTrainer:
 
         z_shape = self.latents(shape_ids)  # (B, latent_dim)
         z_expanded = z_shape.repeat_interleave(N_actual, dim=0)
-        x_flat = points.reshape(B * N_actual, D)
+
+        z = z_shape[:, None, :].expand(-1, N_actual, -1)   # (B, N, latent)
+        h = torch.cat([points, z], dim=-1)                 # (B, N, D+latent)
+        h = h.reshape(B * N_actual, -1)
+
         s_flat = sdf.reshape(B * N_actual, 1)
 
         # Latent regularization
         latent_reg = sigma * (z_shape ** 2).sum() if self.regularize_latent else torch.tensor(0.0, device=self.device)
         #forward pass 
-        pred = self.model(x_flat, z_expanded)
+        pred = self.model(h, z_expanded)
         #compute loss
         if self.clamp_delta is not None:
             data_loss = clamped_l1_loss(pred, s_flat, self.clamp_delta).sum()
@@ -276,10 +280,9 @@ class DeepSDFTrainer:
         z_shape = self.latents(shape_ids)  # (B, latent_dim)
         z_expanded = z_shape.repeat_interleave(N_actual, dim=0)
 
-        # ----------------------
-        # Flatten points and sdf for MLP
-        # ----------------------
-        x_flat = points.reshape(B * N_actual, D)
+        z = z_shape[:, None, :].expand(-1, N_actual, -1)   # (B, N, latent)
+        h = torch.cat([points, z], dim=-1)                 # (B, N, D+latent)
+        h = h.reshape(B * N_actual, -1)
         s_flat = sdf.reshape(B * N_actual, 1)
 
         # ----------------------
@@ -290,7 +293,7 @@ class DeepSDFTrainer:
         # ----------------------
         # Forward pass
         # ----------------------
-        pred = self.model(x_flat, z_expanded)
+        pred = self.model(h, z_expanded)
 
         # ----------------------
         # Compute loss
@@ -333,7 +336,6 @@ class DeepSDFTrainer:
 
         #pull out outliers first its an outlier if abs(sdf) >self.clamp delta
     
-
         preprocessed = []
 
         for sid, pts, sdf in dataloader:
@@ -343,13 +345,15 @@ class DeepSDFTrainer:
             sid = sid.to(self.device)
 
             if stochastic_distribution==True:
+
                 for epoch in range (1, epochs +1):
+
                     sigma = self.sigma0 * min(1.0, 1.0 / epoch)
                     epoch_total, epoch_data, epoch_latent = 0.0, 0.0, 0.0
-                    for sid, pts, sdf in dataloader: 
-                        loss,data_loss,latent_reg = self.train_step_stochastic_distribution(
-                            shape_ids=sid, points=pts, sdf= sdf, sigma=sigma
-                        )
+               
+                    loss,data_loss,latent_reg = self.train_step_stochastic_distribution(
+                        shape_ids=sid, points=pts, sdf= sdf, sigma=sigma
+                    )
 
                     epoch_total += loss
                     epoch_data += data_loss
@@ -441,6 +445,7 @@ class DeepSDFTrainer:
                 epoch_total += loss
                 epoch_data += data_loss
                 epoch_latent += latent_reg
+            
 
             self.loss_history["total"].append(epoch_total / len(preprocessed))
             self.loss_history["data"].append(epoch_data / len(preprocessed))
@@ -454,61 +459,75 @@ class DeepSDFTrainer:
         self.plot_losses()
 
     def train_via_grid_step_gradient_descent(
-            self,
-            learning_rate,
-            snapshot_Every,
-            dropout_reduction_coefficient,
-            grid_data: DataLoader,
-            intial_grid_resolution =1,
-            relative_target_resolution: int= 15,
-            step_descent_epochs=1000, 
-            grid_step_latent_regularization_scaling_constant=1,
-            ):
-    
-        """Fits deepsdf around grid then increases grid resolution.
+        self,
+        learning_rate,
+        snapshot_Every,
+        dropout_reduction_coefficient,
+        grid_data: DataLoader,
+        intial_grid_resolution=1,
+        relative_target_resolution: int = 6,
+        step_descent_epochs=1000,
+        grid_step_latent_regularization_scaling_constant=1,
+        ):
+        
+        """Fits DeepSDF around synthetic grids then increases grid resolution.
         Dropouts 1 -(step resolution)/final resolution scaled back by the dropout reduction coefficent
-         
+        
         Should propagate structure early in the models training. 
         Interpolation strategy grounded in numerical optimization
-          
-        relative_target_resolution scales down from a 1^-initial grid  """
+        
+        relative_target_resolution scales down from a 1^-initial grid
 
-        training_steps = relative_target_resolution-intial_grid_resolution
-        grid_resolution= intial_grid_resolution
+        machine epsilon should allow us to approximate within 16 significant digits 
+        but resolution 7 produces 1 billion points 
+
+        should grid step purely to propagate structure 
+        and then procede with random subsampling until the network converges 
+        """
 
         for sid, pts, sdf in grid_data:
-                points = pts.to(self.device)
-                sdf = sdf.to(self.device)
-                shape_ids= sid.to(self.device)
-                B, N, D = points.shape
-                #extract grid 
+            points = pts.to(self.device)
+            sdf = sdf.to(self.device)
+            shape_ids = sid.to(self.device)
+            B, N, D = points.shape
 
-        for grid_step in range(1, training_steps+1):
 
-            grid_resolution +=1
+        training_steps = relative_target_resolution - intial_grid_resolution
+        grid_resolution = intial_grid_resolution
 
-            grid_spacing = 1/ (2**grid_resolution)
+
+        for grid_step in range(1, training_steps + 1):
+
+            grid_resolution += 1
+
+            grid_spacing = 1 / (2 ** grid_resolution)
             tolerance = grid_spacing / 2.0
+
+            lr = learning_rate * (0.5 ** grid_step)
+
+            grid_optimizer = torch.optim.Adam(
+                [
+                    {"params": self.model.parameters(), "lr": lr},
+                    {"params": self.latents.parameters(), "lr": lr}
+                ]
+            )
 
             print(f"\n[GRID STEP {grid_step}] resolution={grid_resolution} spacing={grid_spacing}")
 
             # -----------------------------------------------------
-            # Identify points that lie on this grid
+            # Generate synthetic grid
             # -----------------------------------------------------
-            coords = points.reshape(-1, D)
-
-            grid_coords = torch.round(coords / grid_spacing) * grid_spacing
-            on_grid_mask = torch.all(
-                torch.abs(coords - grid_coords) < (grid_spacing * 1e-3),
-                dim=1
+            axis = torch.arange(
+                -1.0, 1.0 + grid_spacing, grid_spacing, device=self.device
             )
 
-            grid_points = coords[on_grid_mask]
-            grid_sdf = sdf.reshape(-1, 1)[on_grid_mask]
+            mesh = torch.meshgrid(axis, axis, axis, indexing="ij")
+            grid_points = torch.stack(mesh, dim=-1).reshape(-1, 3)
 
-            if grid_points.shape[0] == 0:
-                print("No dataset points on this grid resolution, skipping.")
-                continue
+            grid_points = grid_points.unsqueeze(0).repeat(B, 1, 1)
+            grid_points = grid_points.reshape(-1, 3)
+
+            grid_sdf = sdf.reshape(-1, 1)
 
             print(f"Grid training points: {grid_points.shape[0]}")
 
@@ -516,35 +535,45 @@ class DeepSDFTrainer:
             # Expand latent vectors
             # -----------------------------------------------------
             z_shape = self.latents(shape_ids)
-            z_expanded = z_shape.repeat_interleave(N, dim=0)
-            z_grid = z_expanded[on_grid_mask]
+            N_grid = grid_points.shape[0] // B
+            z_expanded = z_shape.repeat_interleave(N_grid, dim=0)
 
-            epoch=1
-            converged =False 
-        
-            while not converged and epoch < step_descent_epochs +1:
-                sigma = self.sigma0 * min(1.0, 1.0 / (epoch**grid_step*grid_step_latent_regularization_scaling_constant))
+
+            epoch = 1
+            converged = False
+
+            while not converged and epoch < step_descent_epochs + 1:
+
+                sigma = self.sigma0 * min(
+                    1.0,
+                    1.0 / (epoch ** grid_step * grid_step_latent_regularization_scaling_constant)
+                )
+
                 epoch_total, epoch_data, epoch_latent = 0.0, 0.0, 0.0
 
-                
+
                 # Forward
-                pred = self.model(grid_points, z_grid)
+                pred = self.model(grid_points, z_expanded)
+
 
                 # Loss
-                data_loss = l1_loss(pred, grid_sdf).mean()
+                data_loss = l1_loss(pred, grid_sdf).sum()
                 latent_reg = sigma * (z_shape ** 2).sum()
                 total_loss = data_loss + latent_reg
 
+
                 # Backprop
-                self.optimizer.zero_grad()
+                grid_optimizer.zero_grad()
                 total_loss.backward()
-                self.optimizer.step()
+                grid_optimizer.step()
+
 
                 # -------------------------------------------------
                 # Check convergence condition
                 # -------------------------------------------------
                 with torch.no_grad():
                     max_error = torch.max(torch.abs(pred - grid_sdf)).item()
+
 
                 print(
                     f"[grid {grid_step} epoch {epoch}] "
@@ -553,18 +582,24 @@ class DeepSDFTrainer:
                     f"target={tolerance:.6e}"
                 )
 
+
                 if max_error < tolerance:
                     converged = True
                     print(f"Grid step {grid_step} converged at epoch {epoch}")
 
+
                 if epoch % snapshot_Every == 0:
                     self.save_snapshot(epoch, grid_step)
 
+                epoch += 1
+
             if not converged:
-                print(f"WARNING: grid step {grid_step} did not converge before epoch limit at train step {grid_step}")
+                print(
+                    f"WARNING: grid step {grid_step} did not converge before epoch limit at train step {grid_step}"
+                )
+
 
             print("Grid training complete.")
-
 
     def plot_losses(self):
         """Plot the training curves of total, data, and latent losses."""
