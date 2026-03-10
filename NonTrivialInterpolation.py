@@ -109,6 +109,8 @@ def main():
         samples_per_scene=5000,
         domain_radius=1.0,
         skip_layer=4,
+        training_clamp_dist=None,
+        sample_clamp_dist=1
         regularize_latent=False,
         soft_latent=False
     )

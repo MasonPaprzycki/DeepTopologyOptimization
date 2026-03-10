@@ -98,12 +98,13 @@ model = Model(
     model_name=model_name,
     scenes=scenes,
     latent_dim=2,
-    num_epochs=5000,
+    num_epochs=7000,
+    samples_per_scene=5000,
     training_clamp_dist=None,
-    sample_clamp_dist=1,
+    sample_clamp_dist=2,
     skip_layer=4,
-    regularize_latent=False,
-    soft_latent=True
+    regularize_latent=True,
+    soft_latent=False
 )
 
 print("[INFO] Training model")
@@ -231,6 +232,23 @@ corners = {
 
 }
 
+# ======================================================
+# Colormap (same as 1D experiment)
+# ======================================================
+
+cdict = {
+    "red":   [(0.0, 0.0, 0.0), (0.5, 1.0, 1.0), (1.0, 1.0, 1.0)],
+    "green": [(0.0, 0.0, 0.0), (0.5, 1.0, 1.0), (1.0, 0.0, 0.0)],
+    "blue":  [(0.0, 1.0, 1.0), (0.5, 1.0, 1.0), (1.0, 0.0, 0.0)]
+}
+
+custom_cmap = mcolors.LinearSegmentedColormap("sdf_custom", cdict)
+
+norm = mcolors.TwoSlopeNorm(
+    vmin=-0.6,
+    vcenter=0.0,
+    vmax=0.6
+)
 for i,tx in enumerate(tx_vals):
     for j,ty in enumerate(ty_vals):
 
@@ -248,7 +266,9 @@ for i,tx in enumerate(tx_vals):
         plt.imshow(
             sdf_img,
             extent=(-1.8,1.8,-1.8,1.8),
-            origin="lower"
+            origin="lower",
+            cmap= custom_cmap,
+            norm=norm
         )
 
         plt.colorbar()

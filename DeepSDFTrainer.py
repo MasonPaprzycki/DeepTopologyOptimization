@@ -120,10 +120,6 @@ class DeepSDFTrainer:
         self.latents = self.latents.to(self.device)
 
         # Optimizer: separate learning rates for network and latents
-        optim.Adam([
-            {"params": self.model.parameters(), "lr": lr_net},
-            {"params": self.latents.parameters(), "lr": lr_latent},
-        ])
         self.optimizer = optim.Adam([
             {"params": self.model.parameters(), "lr": lr_net},
             {"params": self.latents.parameters(), "lr": lr_latent},
@@ -254,12 +250,16 @@ class DeepSDFTrainer:
 
         return total_loss.item(), data_loss.item(), latent_reg.item()
 
-        """
-        Fast subsampling strategy but breaks training distribution and leads to worse results. Keeping for reference.
+    def train_step_stochastic_distribution(self, shape_ids, points, sdf, sigma):
+    
+        "Fast subsampling strategy that breaks training with clamped loss" 
 
         # ----------------------
         # Random subsampling
         # ----------------------
+        points = points.to(self.device)
+        B, N, D = points.shape[1]
+
         num_samples = min(5000, N)
         sample_idx = torch.randint(0, N, (B, num_samples), device=self.device)
 
@@ -309,7 +309,7 @@ class DeepSDFTrainer:
         self.optimizer.step()
 
         return total_loss.item(), data_loss.item(), latent_reg.item()
-        """
+        
 
     def save_snapshot(self, epoch: int):
         """Save model, latents, and optimizer states for a given epoch."""
@@ -323,10 +323,12 @@ class DeepSDFTrainer:
         torch.save(snapshot, path)
         print(f"[INFO] Saved snapshot → {path}")
 
-    def train(self, dataloader, epochs, snapshot_every=100):
+    def train(self, dataloader, epochs, snapshot_every=100, stochastic_distribution=False):
         """Full training loop with logging and loss tracking."""
 
         #pull out outliers first its an outlier if abs(sdf) >self.clamp delta
+    
+
         preprocessed = []
 
         for sid, pts, sdf in dataloader:
@@ -334,6 +336,34 @@ class DeepSDFTrainer:
             pts = pts.to(self.device)
             sdf = sdf.to(self.device)
             sid = sid.to(self.device)
+
+            if stochastic_distribution==True:
+                for epoch in range (1, epochs +1):
+                    sigma = self.sigma0 * min(1.0, 1.0 / epoch)
+                    epoch_total, epoch_data, epoch_latent = 0.0, 0.0, 0.0
+                    for sid, pts, sdf in dataloader: 
+                        loss,data_loss,latent_reg = self.train_step_stochastic_distribution(
+                            shape_ids=sid, points=pts, sdf= sdf, sigma=sigma
+                        )
+
+                    epoch_total += loss
+                    epoch_data += data_loss
+                    epoch_latent += latent_reg
+
+                    self.loss_history["total"].append(epoch_total / len(preprocessed))
+                    self.loss_history["data"].append(epoch_data / len(preprocessed))
+                    self.loss_history["latent_reg"].append(epoch_latent / len(preprocessed))
+                    print(f"[{epoch:04d}] total_loss={epoch_total:.6e} "
+                        f"data_loss={epoch_data:.6e} latent_reg={epoch_latent:.6e}")
+
+                    if epoch % snapshot_every == 0:
+                        self.save_snapshot(epoch)
+                
+                
+                self.plot_losses()
+
+                return
+            
 
             B, N, D = pts.shape
 
@@ -407,7 +437,6 @@ class DeepSDFTrainer:
                 epoch_data += data_loss
                 epoch_latent += latent_reg
 
-            # Store averaged losses for plotting
             self.loss_history["total"].append(epoch_total / len(preprocessed))
             self.loss_history["data"].append(epoch_data / len(preprocessed))
             self.loss_history["latent_reg"].append(epoch_latent / len(preprocessed))

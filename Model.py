@@ -382,6 +382,96 @@ class Model:
         sdf = all_samples[:, -1:].reshape(-1, 1)
 
         return pts, sdf
+    
+    def _sample_scene_over_grid(
+        self,
+        scene: SceneWithOperators,
+        grid_pts: torch.Tensor,
+    ):
+        """
+        Samples a scene by evaluating the SDF on a provided grid.
+
+        Unlike _sample_scene():
+            - NO positive/negative balancing
+            - NO clamp filtering
+            - NO adaptive sampling
+            - simply evaluates SDF on every grid point
+
+        Parameters
+        ----------
+        scene : SceneWithOperators
+            Scene definition (SDF operators)
+
+        grid_pts : torch.Tensor
+            (N,3) grid of xyz coordinates
+
+        Returns
+        -------
+        pts : np.ndarray
+            (N, D) where D = xyz + params
+
+        sdf : np.ndarray
+            (N,1)
+        """
+
+        device = self.device
+        grid_pts = grid_pts.to(device)
+
+        all_pts = []
+        all_sdf = []
+
+        for sdf_fn, param_ranges in scene.values():
+
+            n_params = len(param_ranges)
+
+            # ----------------------------------------
+            # Parameter handling
+            # ----------------------------------------
+            if n_params > 0:
+
+                low = torch.tensor(
+                    [a for a, _ in param_ranges],
+                    device=device,
+                    dtype=torch.float32,
+                )
+
+                high = torch.tensor(
+                    [b for _, b in param_ranges],
+                    device=device,
+                    dtype=torch.float32,
+                )
+
+                rp = torch.rand(grid_pts.shape[0], n_params, device=device)
+                params = low.unsqueeze(0) + rp * (high - low).unsqueeze(0)
+
+            else:
+                params = None
+
+            # ----------------------------------------
+            # Evaluate SDF
+            # ----------------------------------------
+            sdf_vals = sdf_fn(grid_pts, params)
+
+            if sdf_vals.dim() == 2:
+                sdf_vals = sdf_vals[:, 0]
+
+            # ----------------------------------------
+            # Convert to numpy
+            # ----------------------------------------
+            pts_np = grid_pts.cpu().numpy()
+            sdf_np = sdf_vals.detach().cpu().numpy().reshape(-1, 1)
+
+            if params is not None:
+                params_np = params.cpu().numpy()
+                pts_np = np.concatenate([pts_np, params_np], axis=1)
+
+            all_pts.append(pts_np)
+            all_sdf.append(sdf_np)
+
+        pts = np.vstack(all_pts).astype(np.float32)
+        sdf = np.vstack(all_sdf).astype(np.float32)
+
+        return pts, sdf
 
 
     def train(self):

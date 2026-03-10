@@ -80,6 +80,8 @@ def main():
         model_name="NonTrivialInterpolationtest",
         scenes=scenes,
         latent_dim=3,
+        training_clamp_dist=None,
+        sample_clamp_dist=1,
         num_epochs=2000,
         domain_radius=1.0,
         regularize_latent=True,
