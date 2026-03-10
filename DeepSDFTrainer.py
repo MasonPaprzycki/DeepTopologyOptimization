@@ -480,9 +480,9 @@ class DeepSDFTrainer:
                 points = pts.to(self.device)
                 sdf = sdf.to(self.device)
                 shape_ids= sid.to(self.device)
-                B, N, D = points.shape[1]
-                
+                B, N, D = points.shape
                 #extract grid 
+
         for grid_step in range(1, training_steps+1):
 
             grid_resolution +=1
