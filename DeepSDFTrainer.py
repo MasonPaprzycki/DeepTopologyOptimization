@@ -15,7 +15,6 @@ def clamp_sdf(x, delta=0.1):
     """Clamp SDF to [-delta, delta] to focus on near-surface points."""
     return torch.clamp(x, -delta, delta)
 
-
 def clamped_l1_loss(pred, target, delta=0.1):
     """Clamped L1 loss, summing differences after clamping."""
     return torch.abs(clamp_sdf(pred, delta) - clamp_sdf(target, delta))
@@ -23,7 +22,6 @@ def clamped_l1_loss(pred, target, delta=0.1):
 def l1_loss(pred, target):
     """Standard L1 loss."""
     return torch.abs(pred - target)
-
 
 class DeepSDF(nn.Module):
     """DeepSDF MLP with latent injection at input and optionally at mid-network."""
@@ -81,7 +79,6 @@ class DeepSDF(nn.Module):
 
         return self.final(h)
 
-
 class SDFDataset(Dataset):
     """Dataset for shapes: each item is (shape_id, points[N,D], sdf[N,1])"""
     def __init__(self, data):
@@ -96,8 +93,6 @@ class SDFDataset(Dataset):
         pts, sdf = self.data[sid]
         return sid, pts, sdf
 
-
-
 class DeepSDFTrainer:
     """Trainer for DeepSDF auto-decoder."""
     def __init__(self, base_directory, model, num_shapes, latent_dim=256, sigma0=1e-4,
@@ -105,7 +100,6 @@ class DeepSDFTrainer:
         
         self.base_directory = base_directory
         self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 
         self.regularize_latent = regularize_latent
         self.model = model.to(self.device)
@@ -247,7 +241,6 @@ class DeepSDFTrainer:
 
         total_loss = data_loss + latent_reg
 
-
         # Backpropagation
         self.optimizer.zero_grad()
         total_loss.backward()
@@ -314,7 +307,6 @@ class DeepSDFTrainer:
 
         return total_loss.item(), data_loss.item(), latent_reg.item()
         
-
     def save_snapshot(self, epoch: int, grid_step:int|None=None):
         """Save model, latents, and optimizer states for a given epoch."""
         snapshot = {
@@ -368,12 +360,10 @@ class DeepSDFTrainer:
                     if epoch % snapshot_every == 0:
                         self.save_snapshot(epoch)
                 
-                
                 self.plot_losses()
 
                 return
             
-
             B, N, D = pts.shape
 
             for b in range(B):
@@ -446,7 +436,6 @@ class DeepSDFTrainer:
                 epoch_data += data_loss
                 epoch_latent += latent_reg
             
-
             self.loss_history["total"].append(epoch_total / len(preprocessed))
             self.loss_history["data"].append(epoch_data / len(preprocessed))
             self.loss_history["latent_reg"].append(epoch_latent / len(preprocessed))
@@ -491,10 +480,8 @@ class DeepSDFTrainer:
             shape_ids = sid.to(self.device)
             B, N, D = points.shape
 
-
         training_steps = relative_target_resolution - intial_grid_resolution
         grid_resolution = intial_grid_resolution
-
 
         for grid_step in range(1, training_steps + 1):
 
@@ -538,7 +525,6 @@ class DeepSDFTrainer:
             N_grid = grid_points.shape[0] // B
             z_expanded = z_shape.repeat_interleave(N_grid, dim=0)
 
-
             epoch = 1
             converged = False
 
@@ -551,29 +537,24 @@ class DeepSDFTrainer:
 
                 epoch_total, epoch_data, epoch_latent = 0.0, 0.0, 0.0
 
-
                 # Forward
                 pred = self.model(grid_points, z_expanded)
-
 
                 # Loss
                 data_loss = l1_loss(pred, grid_sdf).sum()
                 latent_reg = sigma * (z_shape ** 2).sum()
                 total_loss = data_loss + latent_reg
 
-
                 # Backprop
                 grid_optimizer.zero_grad()
                 total_loss.backward()
                 grid_optimizer.step()
-
 
                 # -------------------------------------------------
                 # Check convergence condition
                 # -------------------------------------------------
                 with torch.no_grad():
                     max_error = torch.max(torch.abs(pred - grid_sdf)).item()
-
 
                 print(
                     f"[grid {grid_step} epoch {epoch}] "
@@ -582,11 +563,9 @@ class DeepSDFTrainer:
                     f"target={tolerance:.6e}"
                 )
 
-
                 if max_error < tolerance:
                     converged = True
                     print(f"Grid step {grid_step} converged at epoch {epoch}")
-
 
                 if epoch % snapshot_Every == 0:
                     self.save_snapshot(epoch, grid_step)
@@ -597,7 +576,6 @@ class DeepSDFTrainer:
                 print(
                     f"WARNING: grid step {grid_step} did not converge before epoch limit at train step {grid_step}"
                 )
-
 
             print("Grid training complete.")
 
