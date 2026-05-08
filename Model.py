@@ -12,9 +12,8 @@ SDFCallable = Callable[[torch.Tensor, Optional[torch.Tensor]], torch.Tensor]
 SceneWithOperators = Dict[int, Tuple[SDFCallable, List[Tuple[float, float]]]]
 Scenes = Dict[str, SceneWithOperators]
 
-# ---------------------------------------------------------
+
 # Helpers
-# ---------------------------------------------------------
 def sample_uniform_dirs(n: int, device: torch.device) -> torch.Tensor:
     v = torch.randn(n, 3, device=device)
     return v / (v.norm(dim=1, keepdim=True) + 1e-12)
@@ -89,12 +88,21 @@ class Model:
         skip_layer: int | None = 4,
         soft_latent: bool = True,
         weight_norm: bool = False,
+        train_until_convergence: bool = False,
+        stochastic_distribution: bool = True, 
+        sigma0=1e-4,
+        lr_net=5e-4, 
+        lr_latent=1e-3, 
+        window = 50,
+        #c= 2, 
+        patience = 1,
+        min_delta=0.05
     ):
         self.base_directory = base_directory
         self.regularize_latent = regularize_latent
         self.soft_latent = soft_latent
         self.weight_norm = weight_norm
-
+        self.train_until_convergence = train_until_convergence
         self.model_name = model_name
         self.scenes = scenes
         self.domain_radius = domain_radius
@@ -107,8 +115,16 @@ class Model:
         self.sample_clamp_dist = sample_clamp_dist
         self.samples_per_scene = samples_per_scene
         self.skip_layer = skip_layer
+        self.stochastic_distribution = stochastic_distribution
 
         self.trained_scenes: Dict[str, Scene] = {}
+        self.sigma0 = sigma0
+        self.lr_net = lr_net
+        self.lr_latent = lr_latent
+        self.window = window
+        #self.c = c
+        self.patience= patience
+        self.min_delta = min_delta
 
         os.makedirs(self.base_directory, exist_ok=True)
 
@@ -126,14 +142,14 @@ class Model:
         """
         Load a trained DeepSDF Model from a snapshot .pth file for inference.
         Fully reconstructs the decoder to match checkpoint shapes exactly.
+
+        Don't use unless you're in a pinch this thing is a total mess
         """
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         ckpt = torch.load(snapshot_path, map_location=device)
         state_dict = ckpt["model_state_dict"]
 
-        # --------------------------------------------------
         # Determine decoder parameters from checkpoint
-        # --------------------------------------------------
         layer_keys = sorted([k for k in state_dict.keys() if k.startswith("layers.") and k.endswith("weight")])
         num_layers = len(layer_keys)
         first_layer_weight = state_dict[layer_keys[0]]
@@ -158,9 +174,7 @@ class Model:
         print(f"[INFO] Inferred decoder: input_dim={input_dim}, hidden_dim={hidden_dim}, "
             f"num_layers={num_layers}, latent_dim={latent_dim}, latent_injection_layer={latent_injection_layer}")
 
-        # --------------------------------------------------
         # Rebuild decoder exactly
-        # --------------------------------------------------
         decoder = DeepSDF(
             input_dim=input_dim,
             latent_dim=latent_dim,
@@ -174,9 +188,7 @@ class Model:
         decoder.load_state_dict(state_dict)
         decoder.eval()
 
-        # --------------------------------------------------
         # Instantiate empty model shell
-        # --------------------------------------------------
         model_obj = cls(
             base_directory=base_directory,
             model_name=model_name,
@@ -190,9 +202,8 @@ class Model:
         model_obj.model = decoder
         model_obj.trainer = None
 
-        # --------------------------------------------------
+
         # Load latent embedding
-        # --------------------------------------------------
         latent_embedding = torch.nn.Embedding(
             num_embeddings=latent_state["weight"].shape[0],
             embedding_dim=latent_state["weight"].shape[1],
@@ -236,9 +247,8 @@ class Model:
         """
 
         device = self.device
-        # ---------------------------------------------------------
+   
         # Scene center estimation
-        # ---------------------------------------------------------
         any_sdf_fn, _ = next(iter(scene.values()))
 
         def sdf_eval(xyz: torch.Tensor) -> torch.Tensor:
@@ -264,9 +274,7 @@ class Model:
 
         pos_chunks, neg_chunks = [], []
 
-        # =========================================================
         # Operator-wise sampling
-        # =========================================================
         for sdf_fn, param_ranges in ops:
             n_params = len(param_ranges)
 
@@ -276,9 +284,7 @@ class Model:
             else:
                 low = high = None
 
-            # -----------------------------------------------------
             # Estimate surface radius
-            # -----------------------------------------------------
             dirs = sample_uniform_dirs(2048, device=device)
             probes = shape_center.unsqueeze(0) + dirs * (self.domain_radius * 0.95)
             sd = sdf_fn(probes, None)
@@ -287,9 +293,7 @@ class Model:
             approx_r = (probes - shape_center.unsqueeze(0)).norm(dim=1) - sd
             R = float(torch.median(approx_r).clamp(min=1e-3))
 
-            # -----------------------------------------------------
             # Sampling loop
-            # -----------------------------------------------------
             op_pos, op_neg = [], []
             allowed_pos = int(outlier_pct * target_pos)
             allowed_neg = int(outlier_pct * target_neg)
@@ -474,7 +478,8 @@ class Model:
         return pts, sdf
 
 
-    def train(self, grid= None,stochastic =False):
+    def train(self, grid= None):
+        stochastic = self.stochastic_distribution
         print("[INFO] Sampling scenes")
 
         scene_samples: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
@@ -528,7 +533,14 @@ class Model:
             num_shapes=len(self.scenes),
             latent_dim=self.latent_dim,
             clamp_delta= self.training_clamp_dist,
-            regularize_latent=self.regularize_latent
+            regularize_latent=self.regularize_latent,
+            sigma0=self.sigma0,
+            lr_net=self.lr_net,
+            lr_latent=self.lr_latent,
+            window=self.window,
+            #c=self.c,
+            patience=self.patience,
+            min_delta=self.min_delta
         )
 
         print(f"[INFO] Training for {self.num_epochs} epochs")
@@ -537,7 +549,9 @@ class Model:
             dataloader=loader,
             epochs=self.num_epochs,
             snapshot_every=1000,
-            stochastic_distribution=stochastic
+            stochastic_distribution=stochastic,
+            train_until_convergence=self.train_until_convergence
+
         )
 
         self.model = model
@@ -655,9 +669,7 @@ class Model:
             projected = near_pts - near_sdf.unsqueeze(1) * dirs
             center = projected.median(dim=0).values
 
-        # ------------------------------------------------------------
         # Radius estimation
-        # ------------------------------------------------------------
         dirs = sample_uniform_dirs(n_surface_probes, device)
         probes = center.unsqueeze(0) + dirs * (init_range * 0.95)
 
@@ -668,9 +680,7 @@ class Model:
         radius = torch.median(radii).clamp(min=1e-3).item()
         margin = radius * bbox_margin_ratio
 
-        # ------------------------------------------------------------
         # Grid construction
-        # ------------------------------------------------------------
         lo = center.cpu().numpy() - (radius + margin)
         hi = center.cpu().numpy() + (radius + margin)
 
@@ -686,10 +696,7 @@ class Model:
 
         return pts_flat, x, y, z
 
-    ############################################################
     # SDF → voxel occupancy
-    ############################################################
-
     def sdf_voxel(self, latent,grid_pts,GRID_RES):
 
         with torch.no_grad():
@@ -705,10 +712,8 @@ class Model:
         return occ.reshape(GRID_RES, GRID_RES, GRID_RES)
 
 
-    ############################################################
-    # SDF → mesh reconstruction
-    ############################################################
 
+    # SDF → mesh reconstruction
     def reconstruct_mesh(self, latent, name, grid_pts,GRID_RES):
 
         with torch.no_grad():
@@ -885,7 +890,7 @@ def render_mesh_isometric_pil(mesh: trimesh.Trimesh,
 
     blue_material = pyrender.MetallicRoughnessMaterial(
     baseColorFactor=[0.18, 0.35, 0.85, 1.0],
-  # deep but not saturated blue
+    # deep but not saturated blue
     metallicFactor=0.1,
     roughnessFactor=0.4
     )

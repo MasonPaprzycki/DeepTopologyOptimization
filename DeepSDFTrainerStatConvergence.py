@@ -111,12 +111,11 @@ class DeepSDFTrainer:
             subsample_clamp_dist=0.1, 
             device=None,
             window=50,
-            min_delta = 0.01,
-            patience = 1
+            c=2,
+            patience= 5
             ):
-        
-        self.min_delta = min_delta
-        self.patience = patience
+        self.c=c
+        self.patience=patience
         self.window = window
         self.weight_norm = weight_norm  
         self.base_directory = base_directory
@@ -334,10 +333,8 @@ class DeepSDFTrainer:
         clamp_delta = self.clamp_delta
 
         window = self.window
-        min_delta = self.min_delta
-        patience = self.patience
-
-        old_loss = None
+        c= self.c
+        patience =self.patience
         loss=0
         # STOCHASTIC MODE
         if stochastic_distribution:
@@ -371,7 +368,7 @@ class DeepSDFTrainer:
 
                 num_batches = len(dataloader)
 
-                # avoid division by zero (edge safety)
+                # safety check
                 if num_batches == 0:
                     break
 
@@ -379,27 +376,55 @@ class DeepSDFTrainer:
                 epoch_data /= num_batches
                 epoch_latent /= num_batches
 
-                self.loss_history["total"].append(epoch_total )
+                self.loss_history["total"].append(epoch_total)
                 self.loss_history["data"].append(epoch_data)
                 self.loss_history["latent_reg"].append(epoch_latent)
 
-                loss+= epoch_total
-    
-                if epoch % window == 0:
-                    loss/=window
-                    if old_loss is not None:
-                        delta = abs((old_loss-loss)/old_loss) if old_loss != 0 else float('inf')
-                        if delta < min_delta:
-                            patience_counter += 1
-                            if patience_counter >= patience:
-                                print(f"[INFO] Converged at epoch {epoch} (window stagnation).")
+                loss += epoch_total
+
+
+                # initialize buffers
+                if not hasattr(self, "window_buffer"):
+                    self.window_buffer = []
+                    self.prev_window_mean = None
+                    self.patience_counter = 0
+
+
+                # accumulate window
+                self.window_buffer.append(epoch_total)
+
+                if len(self.window_buffer) == window:
+
+                    # window mean
+                    window_mean = sum(self.window_buffer) / window
+
+                    # window std (noise estimate)
+                    variance = sum((x - window_mean) ** 2 for x in self.window_buffer) / window
+                    sigma = variance ** 0.5
+
+                    if self.prev_window_mean is not None:
+
+                        # Δ_t = L̄_t − L̄_{t-W}
+                        delta = abs(window_mean - self.prev_window_mean)
+
+                        # ε = c * σ / sqrt(W)
+                        threshold = c * sigma / (window ** 0.5)
+
+                        if delta < threshold:
+                            self.patience_counter += 1
+
+                            if self.patience_counter >= patience:
+                                print(f"[INFO] Converged at epoch {epoch} (stationary loss detected).")
                                 if train_until_convergence:
                                     break
                         else:
-                            patience_counter = 0
+                            self.patience_counter = 0
 
-                    old_loss = loss
-                    loss=0
+                    # update state
+                    self.prev_window_mean = window_mean
+
+                    # reset window
+                    self.window_buffer = []
 
                 print(
                     f"[{epoch:04d}] total_loss={epoch_total:.6e} "
@@ -495,6 +520,7 @@ class DeepSDFTrainer:
             
             num_batches = len(preprocessed)
 
+            # safety check
             if num_batches == 0:
                 break
 
@@ -502,27 +528,55 @@ class DeepSDFTrainer:
             epoch_data /= num_batches
             epoch_latent /= num_batches
 
-            self.loss_history["total"].append(epoch_total )
-            self.loss_history["data"].append(epoch_data )
+            self.loss_history["total"].append(epoch_total)
+            self.loss_history["data"].append(epoch_data)
             self.loss_history["latent_reg"].append(epoch_latent)
-            
-            loss+= epoch_total
-            
-            if epoch % window == 0:
-                    loss/=window
-                    if old_loss is not None:
-                        delta = abs((old_loss-loss)/old_loss) if old_loss != 0 else float('inf')
-                        if delta < min_delta:
-                            patience_counter += 1
-                            if patience_counter >= patience:
-                                print(f"[INFO] Converged at epoch {epoch} (window stagnation).")
-                                if train_until_convergence:
-                                    break
-                        else:
-                            patience_counter = 0
 
-                    old_loss = loss
-                    loss=0
+            loss += epoch_total
+
+
+            # initialize buffers
+            if not hasattr(self, "window_buffer"):
+                self.window_buffer = []
+                self.prev_window_mean = None
+                self.patience_counter = 0
+
+
+            # accumulate window
+            self.window_buffer.append(epoch_total)
+
+            if len(self.window_buffer) == window:
+
+                # window mean
+                window_mean = sum(self.window_buffer) / window
+
+                # window std (noise estimate)
+                variance = sum((x - window_mean) ** 2 for x in self.window_buffer) / window
+                sigma = variance ** 0.5
+
+                if self.prev_window_mean is not None:
+
+                    # Δ_t = L̄_t − L̄_{t-W}
+                    delta = abs(window_mean - self.prev_window_mean)
+
+                    # ε = c * σ / sqrt(W)
+                    threshold = c * sigma / (window ** 0.5)
+
+                    if delta < threshold:
+                        self.patience_counter += 1
+
+                        if self.patience_counter >= patience:
+                            print(f"[INFO] Converged at epoch {epoch} (stationary loss detected).")
+                            if train_until_convergence:
+                                break
+                    else:
+                        self.patience_counter = 0
+
+                # update state
+                self.prev_window_mean = window_mean
+
+                # reset window
+                self.window_buffer = []
 
             print(
                 f"[{epoch:04d}] total_loss={epoch_total:.6e} "

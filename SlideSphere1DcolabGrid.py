@@ -93,9 +93,23 @@ def main():
         min_delta=0.05
     )
 
-    print("[INFO] Training...")
-    model.train()
-    print("[INFO] Done")
+    grid_res = 128
+
+    x = np.linspace(-1.8,1.8,grid_res)
+    y = np.linspace(-1.8,1.8,grid_res)
+    z= np.linspace(-1.8,1.8,grid_res)
+
+
+    X,Y,Z = np.meshgrid(x,y,z)
+
+    xyz_np = np.stack([X,Y,Z],axis=-1)
+
+    xyz = torch.tensor(xyz_np,dtype=torch.float32).reshape(-1,3).to(device)
+
+    print("[INFO] Training model...")
+    model.train(grid=xyz)
+    print("[INFO] Training complete.")
+
 
 
     # ============================================================

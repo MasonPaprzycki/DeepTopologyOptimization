@@ -27,9 +27,7 @@ def visualize_analytic_sdf(
 
     print(f"[ANALYTIC] Visualizing {name}")
 
-    # --------------------------------------------------
     # Build grid
-    # --------------------------------------------------
     x = np.linspace(grid_center[0] - bbox_half, grid_center[0] + bbox_half, grid_res)
     y = np.linspace(grid_center[1] - bbox_half, grid_center[1] + bbox_half, grid_res)
     z = np.linspace(grid_center[2] - bbox_half, grid_center[2] + bbox_half, grid_res)
@@ -37,9 +35,7 @@ def visualize_analytic_sdf(
     grid = np.stack(np.meshgrid(x, y, z, indexing="ij"), axis=-1)
     pts = torch.from_numpy(grid.reshape(-1, 3)).float()
 
-    # --------------------------------------------------
     # Evaluate SDF
-    # --------------------------------------------------
     with torch.no_grad():
         sdf = sdf_fn(pts).squeeze(1).cpu().numpy()
 
@@ -49,9 +45,7 @@ def visualize_analytic_sdf(
         print(f"[WARN] {name}: no zero-crossing found, skipping")
         return
 
-    # --------------------------------------------------
     # Marching cubes
-    # --------------------------------------------------
     verts, faces, normals, _ = measure.marching_cubes(volume, level=0.0)
     scale = x[1] - x[0]
     verts = verts * scale + np.array([x[0], y[0], z[0]])
